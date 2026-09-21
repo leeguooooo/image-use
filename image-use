@@ -2250,6 +2250,11 @@ def _clear_web_composer(ab, session, remaining) -> None:
         pass
 
 
+def _canonicalize_composer_text(text: str) -> str:
+    """Normalize editor-equivalent whitespace before composer verification."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+
+
 def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
     """Paste, verify exact editor text and attachments, then click Send once.
 
@@ -2274,7 +2279,7 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
             if state.get("user_turns") != initial.get("user_turns"):
                 raise GatewayError("ChatGPT submitted while entering the prompt; "
                                    "stopped without sending again. Check the conversation.")
-            if state.get("text") != user_text:
+            if _canonicalize_composer_text(state.get("text") or "") != _canonicalize_composer_text(user_text):
                 raise GatewayError(
                     f"ChatGPT composer text differs from the supplied prompt "
                     f"(expected {len(user_text)} characters, got "
