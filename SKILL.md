@@ -1,6 +1,6 @@
 ---
 name: "image-use"
-version: "0.29.2"
+version: "0.30.0"
 description: >-
   Backend-neutral image generation: create new raster images and looping
   GIF/WebP animations through the local one-file image-use CLI (formerly
@@ -291,17 +291,9 @@ A vague prompt yields a useless figure. Make the prompt describe the figure's **
 
 ## Error handling
 
-**First step for any "which backend / why isn't web working" failure:** run `image-use doctor`. It reports, read-only, the CLI's own version vs. the latest on `main`, whether each backend is set up (codex token; chrome-use installed + version; relay connected; logged-in Chrome profiles), and **which one `auto` would pick** — turning a vague "no logged-in browser" into a precise checklist.
+**First step for any "which backend / why isn't web working" failure:** run `image-use doctor`. It reports, read-only, the CLI's own version vs. the latest GitHub release, whether each backend is set up (codex token; chrome-use installed + version; relay connected; logged-in Chrome profiles), and **which one `auto` would pick** — turning a vague "no logged-in browser" into a precise checklist.
 
-**Automatic updates.** `skills` has no scheduler of its own, so an interactive CLI run checks `main` at most once a day. When a newer version exists it invokes the same `skills update` path as the explicit command, then uses the new code on the next run. If automatic installation is unavailable or fails, it falls back to a short stderr notice that **lists what changed** since your version:
-
-```
-提示:image-use 0.14.0 可用(当前 0.12.0)。更新:image-use update
-  • 0.14.0:更新提示现在会列出每个新版本改了什么
-  • 0.13.0:新增每天一次的新版本提示…
-```
-
-It never touches stdout and is skipped under `--quiet`/`--no-progress`; `doctor` checks unconditionally and prints the same change list. To turn checking off entirely, set `IMAGE_USE_NO_UPDATE_CHECK=1`. To keep the daily check and notice but disable automatic installation, set `IMAGE_USE_NO_AUTO_UPDATE=1`. When you see the fallback notice, run `image-use update` — it runs the `skills` manager for you, through npx when `skills` isn't on PATH (it usually isn't), so it works without a global install (or re-run the self-heal `curl`).
+Update notices are covered under [Upgrade](#upgrade).
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -318,6 +310,19 @@ It never touches stdout and is skipped under `--quiet`/`--no-progress`; `doctor`
 | `warning: project 'X' unavailable (…); using a plain chat` | (web) Project list/create API hiccup, or the project page's composer didn't render | Nothing — the image still generated, just in a top-level chat. If it recurs, check the name or pass `--project ""` |
 | `chatgpt.com rate-limited this account ('Too many requests') …` | (web) The page surface temporarily blocked the account for making requests too quickly | Wait a few minutes. If it fired *before* submit, `auto` mode already fell back to codex; if *after* submit, check the conversation later — the image may still appear there. Don't retry in a loop |
 | `waiting for a free web/codex slot (max N concurrent …)` | More parallel runs than the backend's concurrency cap | Nothing — the run starts when a slot frees up; queue time doesn't eat `--timeout` |
+
+## Upgrade
+
+When any `image-use` command prints `image-use X is available`, tell the user and offer to run
+`image-use upgrade` (it updates the CLI and this skill). Check without changing anything:
+`image-use upgrade --check` (or `--json`). The user may also just say "升级 image-use" / "upgrade image-use".
+`image-use update` and the old `chatgpt-imagegen update` do the same thing.
+
+If the skill came from somewhere `upgrade` can't refresh:
+- Claude Code plugin: `claude plugin update image-use@leeguooooo-plugins`
+- Whole family: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/plugins/main/upgrade-use-family.sh | sh`
+
+The notice is one stderr line, checked at most once a day; `IMAGE_USE_NO_UPDATE_CHECK=1` (or the old `CHATGPT_IMAGEGEN_NO_UPDATE_CHECK`, or the family-wide `USE_NO_UPDATE_CHECK`) turns it off.
 
 ## Internals (for maintainers / debugging)
 

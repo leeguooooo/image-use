@@ -46,10 +46,12 @@ Got a **Gemini** subscription too? Two more backends use it instead of OpenAI: `
 ## Upgrade
 
 ```bash
-image-use update
+image-use upgrade            # install the latest release and refresh the skill
+image-use upgrade --check    # only report: image-use 0.29.2 -> 0.30.0
+image-use upgrade --json     # the same as JSON
 ```
 
-It runs the `skills` manager for you — directly when `skills` is on PATH, through `npx` when it isn't (it usually isn't). Interactive runs check for a newer version at most once a day and upgrade automatically for the next run; failures fall back to a notice listing what changed. `IMAGE_USE_NO_AUTO_UPDATE=1` disables installation but keeps the check and notice, while `IMAGE_USE_NO_UPDATE_CHECK=1` disables both. `--quiet`/`--no-progress` never upgrades in the background.
+`upgrade` (alias `update`) installs the newest GitHub release the same way this copy was installed — `skills update` for an `npx skills add` install, `git pull --ff-only` for a clone, a fresh copy of the script for a standalone file — then refreshes every other copy of the skill it finds (Claude Code plugin, clones and copies under `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills`). Any other command checks for a newer release at most once a day and prints one line to stderr when there is one. `IMAGE_USE_NO_UPDATE_CHECK=1` or the family-wide `USE_NO_UPDATE_CHECK=1` turns the check off; it is also skipped when `CI` is set. Nothing is installed until you run `upgrade`.
 
 **On 0.23.1 or earlier?** That self-update only looked for a global `skills` and gave up when it was missing, so it cannot deliver its own fix. Bootstrap once with (installs from before the rename are registered as `chatgpt-imagegen`):
 
@@ -57,7 +59,7 @@ It runs the `skills` manager for you — directly when `skills` is on PATH, thro
 npx -y skills update chatgpt-imagegen
 ```
 
-After that `image-use update` works on its own.
+After that `image-use upgrade` works on its own.
 
 ## Usage
 

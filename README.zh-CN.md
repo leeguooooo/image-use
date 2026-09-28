@@ -46,10 +46,12 @@ sudo ln -sf image-use /usr/local/bin/chatgpt-imagegen   # 可选:保留旧命令
 ## 升级
 
 ```bash
-image-use update
+image-use upgrade            # 装最新版并刷新 skill
+image-use upgrade --check    # 只查不改:image-use 0.29.2 -> 0.30.0
+image-use upgrade --json     # 同上,输出 JSON
 ```
 
-它会替你调用 `skills` 管理器——PATH 上有 `skills` 就直接用,没有则走 `npx`(通常都没有)。交互式运行每天最多检查一次新版并自动升级,下次运行生效;失败时会退回提醒并列出变更。`IMAGE_USE_NO_AUTO_UPDATE=1` 只关闭自动安装,`IMAGE_USE_NO_UPDATE_CHECK=1` 连检查也关闭。`--quiet`/`--no-progress` 不会在后台升级。
+`upgrade`(别名 `update`)按这份安装的来路装最新的 GitHub Release——`npx skills add` 装的走 `skills update`,git clone 的走 `git pull --ff-only`,单独拷贝的脚本直接换成新版——然后刷新它找到的其他 skill 副本(Claude Code 插件,以及 `~/.agents/skills`、`~/.claude/skills`、`~/.codex/skills` 下的 clone 和拷贝)。其他命令每天最多检查一次新版,有新版就往 stderr 打一行提示。设 `IMAGE_USE_NO_UPDATE_CHECK=1` 或全家通用的 `USE_NO_UPDATE_CHECK=1` 可关闭检查,设了 `CI` 时也不检查。不运行 `upgrade` 就不会安装任何东西。
 
 **还停在 0.23.1 或更早?** 那时的自升级只找全局 `skills`,找不到就放弃,所以它没法把这个修复本身装进来。先手动破一次局(改名前的安装在 skills 里登记的名字是 `chatgpt-imagegen`):
 
@@ -57,7 +59,7 @@ image-use update
 npx -y skills update chatgpt-imagegen
 ```
 
-之后 `image-use update` 就能自己跑了。
+之后 `image-use upgrade` 就能自己跑了。
 
 ## 用法
 

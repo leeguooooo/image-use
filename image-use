@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.29.2"
+__version__ = "0.30.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.30.0]: 按 *-use 家族约定升级——`image-use upgrade`(`update` 仍可用)按安装方式装最新 GitHub Release 并刷新各处 skill,`--check`/`--json` 只查不改;每天一次的新版提示改为 stderr 一行,以 GitHub Release 为准,CI / USE_NO_UPDATE_CHECK / IMAGE_USE_NO_UPDATE_CHECK 可关闭;不再在后台自动升级
 # WHATSNEW[0.29.2]: web 后端发送前核对提示词时,把编辑器等价的空白(CRLF/CR 换行、行首空格被转成的不换行空格 U+00A0)视为相同,不再因此误判「文本不一致」而拒绝发送(#39)
 # WHATSNEW[0.29.1]: SKILL.md 的 description 超过 1024 字符(pi 会拒收整个 skill),精简到限制以内,并加单元测试守住长度和版本号同步
 # WHATSNEW[0.29.0]: 修好 web 后端的多行提示词与多参考图——提示词改为整段粘贴(旧的逐键输入会把换行当发送,拆成多条消息),发送前核对编辑器里的完整文本、等所有参考图真正传完服务端才点一次发送,结果不确定时只报告不重发;未发送就中止的运行会清掉自己粘贴的草稿,不再让下一次运行卡在「输入框非空」(#34)
@@ -146,15 +147,21 @@ FALLBACK_UA = f"codex_cli_rs/{FALLBACK_VERSION} (Mac OS 26.0.1; arm64) chatgpt-i
 AUTH_PATH = Path.home() / ".codex" / "auth.json"
 VERSION_PATH = Path.home() / ".codex" / "version.json"
 
-# Self-update check. `skills add` has no auto-update, so interactive runs check
-# main once a day and ask the existing skills manager to refresh the install.
-# Failure degrades to the old soft notice. It never touches stdout and is
-# silenced by `--no-progress` or IMAGE_USE_NO_UPDATE_CHECK; users can keep
-# the check/notice but disable installation with IMAGE_USE_NO_AUTO_UPDATE.
-UPDATE_CHECK_URL = (
-    "https://raw.githubusercontent.com/leeguooooo/image-use/main/image-use"
-)
+# Update check — the *-use family upgrade convention
+# (https://github.com/leeguooooo/plugins/blob/main/docs/upgrade.md). The latest
+# version is the newest non-prerelease GitHub release. Any run checks it at most
+# once a day (2 s timeout, cached) and prints one stderr line when it is newer;
+# nothing is installed until the user runs `image-use upgrade`. Silenced by CI,
+# IMAGE_USE_NO_UPDATE_CHECK (legacy CHATGPT_IMAGEGEN_NO_UPDATE_CHECK) or the
+# family-wide USE_NO_UPDATE_CHECK.
+UPDATE_REPO = "leeguooooo/image-use"
+UPDATE_RELEASES_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+# The CLI file at a given git ref (a release tag), for `upgrade` and WHATSNEW.
+UPDATE_RAW_URL = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{{ref}}/image-use"
 UPDATE_CHECK_INTERVAL = 86400  # seconds; at most one network check per day
+UPDATE_NOTICE_TIMEOUT = 2.0    # the daily check must not slow a run down
+UPDATE_FETCH_TIMEOUT = 10.0    # an explicit `upgrade` / `doctor` can wait longer
+PLUGIN_MARKETPLACE = "leeguooooo-plugins"
 
 # Environment variables. The tool was called chatgpt-imagegen until it grew
 # non-ChatGPT backends; every IMAGE_USE_<X> variable still honours its old
@@ -4562,12 +4569,34 @@ def _copy_ref_into_asset(asset_dir: Path, src: str, existing: list[str]) -> str:
     return fname
 
 
-# ---------- self-update reminder ----------
+# ---------- update check ----------
 
 def _update_cache_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
-    root = Path(base) if base else Path.home() / ".config"
-    return root / CONFIG_DIRNAME / "update-check.json"
+    """``${XDG_CACHE_HOME:-~/.cache}/image-use/update-check.json``."""
+    base = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "image-use" / "update-check.json"
+
+
+def _update_check_disabled() -> bool:
+    """True when CI, IMAGE_USE_NO_UPDATE_CHECK (or its legacy
+    CHATGPT_IMAGEGEN_ spelling) or USE_NO_UPDATE_CHECK is set."""
+    return bool(os.environ.get("CI")
+                or _env("IMAGE_USE_NO_UPDATE_CHECK")
+                or os.environ.get("USE_NO_UPDATE_CHECK"))
+
+
+def _should_check_for_update(argv: list[str]) -> bool:
+    """The daily check runs for every invocation except `upgrade`/`update`,
+    `doctor` (which does its own fresh check), `--version` and `--help`."""
+    if argv and argv[0] in ("upgrade", "update", "doctor"):
+        return False
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg in ("-h", "--help", "-V", "--version"):
+            return False
+    return True
 
 
 def _parse_whatsnew(text: str) -> dict:
@@ -4578,23 +4607,59 @@ def _parse_whatsnew(text: str) -> dict:
     return out
 
 
-def _fetch_latest_info(timeout: float = 4.0):
-    """Best-effort `(latest_version, {ver: note})` from the script on main.
+def _github_open(url: str, timeout: float, accept: str):
+    headers = {"User-Agent": f"image-use/{__version__} update-check",
+               "Accept": accept}
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout)
 
-    Reads only an 8KB prefix (both `__version__` and the WHATSNEW lines live at
-    the top), so it never pulls the whole file. Any network/parse failure returns
-    `(None, {})` — this is a nicety, never a gate."""
+
+def _release_version(tag: Any) -> str | None:
+    """`v1.2.3` / `1.2.3` → `1.2.3`; anything else → None."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+){1,3})", str(tag or "").strip())
+    return m.group(1) if m else None
+
+
+def _fetch_latest_release(timeout: float = UPDATE_FETCH_TIMEOUT) -> str | None:
+    """Version of the newest non-prerelease GitHub release, or None on any
+    network / API / parse failure."""
     try:
-        req = urllib.request.Request(
-            UPDATE_CHECK_URL,
-            headers={"User-Agent": f"chatgpt-imagegen/{__version__} update-check"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _github_open(UPDATE_RELEASES_URL, timeout,
+                          "application/vnd.github+json") as r:
+            data = json.loads(r.read(1 << 20).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+        return None
+    return _release_version(data.get("tag_name"))
+
+
+def _fetch_whatsnew(version: str, timeout: float = UPDATE_FETCH_TIMEOUT) -> dict:
+    """WHATSNEW notes from the CLI at tag ``v<version>`` (8KB prefix only:
+    `__version__` and the WHATSNEW lines sit at the top). {} on failure."""
+    try:
+        with _github_open(UPDATE_RAW_URL.format(ref=f"v{version}"), timeout,
+                          "text/plain") as r:
             head = r.read(8192).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
+        return {}
+    return _parse_whatsnew(head)
+
+
+def _fetch_latest_info(timeout: float = UPDATE_FETCH_TIMEOUT):
+    """Best-effort `(latest_version, {ver: note})`; `(None, {})` on failure."""
+    latest = _fetch_latest_release(timeout)
+    if not latest:
         return None, {}
-    m = re.search(r'__version__\s*=\s*"([\d.]+)"', head)
-    return (m.group(1) if m else None), _parse_whatsnew(head)
+    notes = _fetch_whatsnew(latest, timeout) if _is_newer(latest) else {}
+    return latest, notes
+
+
+def _is_newer(latest: str | None, current: str = __version__) -> bool:
+    return bool(latest) and _version_tuple(latest) > _version_tuple(current)
 
 
 def _changes_since(notes: dict, base: str = __version__) -> list[tuple[str, str]]:
@@ -4605,85 +4670,60 @@ def _changes_since(notes: dict, base: str = __version__) -> list[tuple[str, str]
     return [(v, notes[v]) for v in vers]
 
 
-def _format_update_notice(latest: str, notes: dict, max_lines: int = 3) -> str:
-    """One header line + up to ``max_lines`` `• ver: what-changed` lines."""
-    head = (f"提示:image-use {latest} 可用(当前 {__version__})。"
-            f"更新:image-use update")
-    changes = _changes_since(notes)
-    lines = [head]
-    for ver, note in changes[:max_lines]:
-        lines.append(f"  • {ver}:{note}")
-    extra = len(changes) - max_lines
-    if extra > 0:
-        lines.append(f"  • 另有 {extra} 项更新")
-    return "\n".join(lines)
-
-
-def _installed_script_version() -> str | None:
-    """Version currently stored at the path this process was launched from."""
-    try:
-        head = Path(__file__).read_text(encoding="utf-8")[:8192]
-    except OSError:
-        return None
-    match = re.search(r'^__version__\s*=\s*"([\d.]+)"', head, re.MULTILINE)
-    return match.group(1) if match else None
-
-
-def _maybe_notify_update(emit, *, auto_update: bool = False) -> None:
-    """Once a day, handle a newer version found on main.
-
-    Interactive callers pass ``auto_update=True``: use the same skills-manager
-    path as the explicit ``update`` command and fall back to the ordinary notice
-    if the runner is missing or fails. Tests and other callers default to the
-    original notice-only behavior.
-
-    Caches the result (timestamp, latest version, and the what's-new notes)
-    under the config dir so normal runs do no network at all between daily
-    checks. Fully skipped when IMAGE_USE_NO_UPDATE_CHECK is set. Never
-    raises."""
-    if _env("IMAGE_USE_NO_UPDATE_CHECK"):
-        return
+def _write_update_cache(checked_at: float, latest: str | None) -> None:
     cache = _update_cache_path()
-    now = time.time()
     try:
-        data = json.loads(cache.read_text(encoding="utf-8"))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_name(cache.name + ".tmp")
+        tmp.write_text(json.dumps({"checked_at": int(checked_at), "latest": latest}),
+                       encoding="utf-8")
+        os.replace(tmp, cache)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _cached_latest(now: float | None = None) -> str | None:
+    """Latest release version, from the cache when it is under a day old,
+    else from GitHub with a 2 s timeout. A failed fetch still stamps
+    `checked_at` (keeping the last known version) so an offline machine is
+    not retried on every call."""
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(_update_cache_path().read_text(encoding="utf-8"))
         last = float(data.get("checked_at", 0))
         latest = data.get("latest")
-        notes = data.get("notes") or {}
     except Exception:  # noqa: BLE001
-        last, latest, notes = 0.0, None, {}
+        last, latest = 0.0, None
+    if not isinstance(latest, str) or not _release_version(latest):
+        latest = None
+    if 0 <= now - last < UPDATE_CHECK_INTERVAL:
+        return latest
+    fetched = _fetch_latest_release(UPDATE_NOTICE_TIMEOUT)
+    if fetched:
+        latest = fetched
+    _write_update_cache(now, latest)
+    return latest
 
-    if now - last >= UPDATE_CHECK_INTERVAL:
-        fetched_latest, fetched_notes = _fetch_latest_info()
-        if fetched_latest:                      # keep last-known if the fetch failed
-            latest, notes = fetched_latest, fetched_notes
-        try:
-            cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(
-                {"checked_at": now, "latest": latest, "notes": notes}), encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
 
-    if not latest or _version_tuple(latest) <= _version_tuple(__version__):
+def _update_notice(latest: str) -> str:
+    return (f"image-use {latest} is available (you have {__version__}). "
+            f"Upgrade: image-use upgrade")
+
+
+def _maybe_notify_update(emit=None) -> None:
+    """Once a day, print one line to stderr when a newer release exists.
+    Never touches stdout, never installs anything, never raises."""
+    if _update_check_disabled():
         return
-
-    if auto_update and not _env("IMAGE_USE_NO_AUTO_UPDATE"):
-        argv = _update_runner()
-        if argv:
-            emit(f"检测到 image-use {latest},正在自动升级…")
-            try:
-                result = subprocess.run(
-                    argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    text=True, timeout=120)
-            except (OSError, subprocess.TimeoutExpired):
-                result = None
-            installed = _installed_script_version()
-            if (result is not None and result.returncode == 0 and installed
-                    and _version_tuple(installed) >= _version_tuple(latest)):
-                emit(f"已自动升级到 v{latest};本次仍使用 v{__version__},下次运行生效。")
-                return
-
-    emit(_format_update_notice(latest, notes))
+    try:
+        latest = _cached_latest()
+        if _is_newer(latest):
+            if emit is None:
+                print(_update_notice(latest), file=sys.stderr)
+            else:
+                emit(_update_notice(latest))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _default_styles_doc() -> dict:
@@ -5432,7 +5472,7 @@ def _doctor_command(argv: list[str]) -> int:
     latest, notes = _fetch_latest_info()  # always fresh here (no throttle)
     if latest and _version_tuple(latest) > _version_tuple(__version__):
         line("warn", "version",
-             f"{__version__} → {latest} 可用 (image-use update)")
+             f"{__version__} → {latest} 可用 (image-use upgrade)")
         for ver, note in _changes_since(notes)[:5]:
             print(f"               • {ver}:{note}")
     else:
@@ -5538,7 +5578,7 @@ subcommands:
   image-use animate PROMPT  generate a 4x2 sprite sheet and encode a loop
   image-use doctor          check which backend is ready (and which auto picks)
   image-use style <verb>    manage reusable style/character assets (alias: styles)
-  image-use update          upgrade this CLI (alias: upgrade)
+  image-use upgrade         install the latest release (--check, --json; alias: update)
 
 docs: https://github.com/leeguooooo/image-use
 """
@@ -5584,49 +5624,269 @@ def _installed_skill_name() -> str:
     return SKILL_NAME
 
 
-def _self_update() -> int:
-    """`image-use update` / `upgrade` — refresh the installed CLI.
-
-    Reserving these words as a subcommand fixes a real trap: without it,
-    `image-use upgrade` silently became an image prompt (drawing the word
-    "upgrade" and burning quota). Delivery is the `skills` manager (what the
-    daily update reminder points at) — run directly when it is on PATH, else
-    through npx; only when neither exists does this print the command instead
-    of running it. On success it reports the latest known version — noting that
-    the running process stays on the old code until the next invocation (this
-    .py file was just replaced underneath it).
-    """
-    argv = _update_runner()
-    if argv is None:
-        print("`skills` 和 `npx` 都不在 PATH 上,无法自动升级。"
-              "装上 Node 后执行:\n"
-              f"  npx -y skills update {_installed_skill_name()}", file=sys.stderr)
-        return 1
-    print("升级中:" + " ".join(argv), file=sys.stderr)
+def _git_toplevel(path: Path) -> Path | None:
+    """Root of the git work tree containing ``path``, or None."""
+    if not shutil.which("git"):
+        return None
     try:
-        rc = subprocess.run(argv).returncode
+        r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.strip()
+    if r.returncode != 0 or not out:
+        return None
+    try:
+        return Path(out).resolve()
+    except OSError:
+        return None
+
+
+def _git_checkout_root(path: Path) -> Path | None:
+    """``path`` when it is itself the root of a git clone of this repo.
+
+    Only a clone whose root IS the folder counts: a copied skill folder that
+    happens to sit inside some other repo (a dotfiles repo holding
+    ~/.claude, say) must never get that repo pulled."""
+    top = _git_toplevel(path)
+    try:
+        return top if top is not None and top == path.resolve() else None
+    except OSError:
+        return None
+
+
+def _is_plugin_path(path: Path) -> bool:
+    parts = path.parts
+    return any(a == ".claude" and b == "plugins" for a, b in zip(parts, parts[1:]))
+
+
+def _plugin_installs() -> list[dict]:
+    """Claude Code plugin installs of this skill (installed_plugins.json keys
+    starting `image-use@`, or the pre-rename `chatgpt-imagegen@`)."""
+    registry = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        plugins = data if isinstance(data, dict) else {}
+    out = []
+    for key, entries in plugins.items():
+        if not isinstance(key, str) or not key.startswith(
+                (f"{SKILL_NAME}@", f"{LEGACY_SKILL_NAME}@")):
+            continue
+        entry = entries[0] if isinstance(entries, list) and entries else entries
+        path = entry.get("installPath") if isinstance(entry, dict) else None
+        out.append({"channel": "claude-plugin", "path": str(path or registry),
+                    "update": f"claude plugin update {key}"})
+    return out
+
+
+def _skill_roots() -> list[Path]:
+    home = Path.home()
+    return [home / ".agents" / "skills", home / ".claude" / "skills",
+            home / ".codex" / "skills"]
+
+
+def _find_skill_installs() -> list[dict]:
+    """Every installed copy of this skill, with how to refresh it:
+    `claude-plugin`, `git` (a clone) or `copy` (e.g. `npx skills add`)."""
+    found = _plugin_installs()
+    seen: set[str] = set()
+    for root in _skill_roots():
+        for name in (SKILL_NAME, LEGACY_SKILL_NAME):
+            try:
+                real = (root / name).resolve()
+                if not real.is_dir():
+                    continue
+            except OSError:
+                continue
+            if str(real) in seen:
+                continue
+            seen.add(str(real))
+            if _git_checkout_root(real) is not None:
+                found.append({"channel": "git", "path": str(real),
+                              "update": f"git -C {real} pull --ff-only"})
+            elif (real / "SKILL.md").is_file():
+                found.append({"channel": "copy", "path": str(real),
+                              "update": f"npx skills update {name}"})
+    return found
+
+
+def _cli_install_route() -> tuple[str, Path]:
+    """How this CLI file was installed, from where it lives:
+    `claude-plugin` (the plugin cache), `git` (a clone), `skills` (a skill
+    folder the `skills` manager copied) or `file` (a lone copied script)."""
+    here = Path(__file__).resolve()
+    folder = here.parent
+    if _is_plugin_path(here):
+        return "claude-plugin", folder
+    if _git_checkout_root(folder) is not None:
+        return "git", folder
+    if (folder / "SKILL.md").is_file():
+        return "skills", folder
+    return "file", here
+
+
+def _replace_script(target: Path, version: str) -> int:
+    """Swap the lone script at ``target`` for the one at tag ``v<version>``."""
+    url = UPDATE_RAW_URL.format(ref=f"v{version}")
+    try:
+        with _github_open(url, 30, "text/plain") as r:
+            data = r.read()
+    except Exception as e:  # noqa: BLE001
+        print(f"error: download failed: {url}: {e}", file=sys.stderr)
+        return 2
+    m = re.search(rb'^__version__\s*=\s*"([\d.]+)"', data[:8192], re.MULTILINE)
+    if not data.startswith(b"#!") or not m or m.group(1).decode() != version:
+        print(f"error: {url} is not image-use {version}", file=sys.stderr)
+        return 2
+    tmp = target.with_name(f".{target.name}.upgrade")
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
     except OSError as e:
-        print(f"error: 无法运行 `skills update`:{e}", file=sys.stderr)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        print(f"error: cannot replace {target}: {e}\n"
+              f"  run: curl -fsSL {url} -o /tmp/image-use && "
+              f"sudo install /tmp/image-use {target}", file=sys.stderr)
         return 1
-    if rc == 0:
-        latest, _ = _fetch_latest_info()
-        if latest and _version_tuple(latest) > _version_tuple(__version__):
-            print(f"完成 → v{latest}(当前进程仍是 v{__version__},下次运行即为新版)。",
-                  file=sys.stderr)
-        elif latest:
-            print(f"已是最新(v{__version__})。", file=sys.stderr)
+    return 0
+
+
+def _run_step(argv: list[str], cwd: str | None = None) -> tuple[int, str]:
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return r.returncode, (r.stderr or r.stdout or "").strip()
+
+
+def _install_cli(route: str, where: Path, latest: str) -> int:
+    """Step 1 of `upgrade`: install ``latest`` through the route this CLI
+    came from. 0 ok, 2 download failed, 1 anything else."""
+    if route == "claude-plugin":
+        return 0  # the plugin refresh in step 2 replaces this file
+    if route == "git":
+        print(f"cli: git -C {where} pull --ff-only")
+        rc, out = _run_step(["git", "-C", str(where), "pull", "--ff-only"])
+        if rc != 0:
+            print(f"error: git pull failed (not forcing): {out}", file=sys.stderr)
+            return 1
+        return 0
+    if route == "skills":
+        argv = _update_runner()
+        if argv is None:
+            print("error: neither `skills` nor `npx` is on PATH; install Node, then run:\n"
+                  f"  npx -y skills update {_installed_skill_name()}", file=sys.stderr)
+            return 1
+        print("cli: " + " ".join(argv))
+        try:
+            rc = subprocess.run(argv).returncode
+        except OSError as e:
+            print(f"error: cannot run `skills update`: {e}", file=sys.stderr)
+            return 1
+        return rc
+    print(f"cli: replacing {where} with the v{latest} release")
+    return _replace_script(where, latest)
+
+
+def _refresh_skill(skill: dict, cli_route: str, cli_where: Path) -> None:
+    """Step 2 of `upgrade`: refresh one installed skill copy."""
+    channel, path = skill["channel"], skill["path"]
+    label = f"skill [{channel}] {path}:"
+    if channel == "git" and cli_route == "git" and Path(path) == cli_where:
+        print(f"{label} pulled above")
+    elif channel == "git":
+        rc, out = _run_step(["git", "-C", path, "pull", "--ff-only"])
+        print(f"{label} " + ("pulled" if rc == 0
+                             else f"not updated (git pull --ff-only failed: {out})"))
+    elif channel == "claude-plugin":
+        claude = shutil.which("claude")
+        if claude is None:
+            print(f"{label} run: {skill['update']}")
+            return
+        rc, out = _run_step([claude, *skill["update"].split()[1:]])
+        print(f"{label} " + ("updated" if rc == 0
+                             else f"`{skill['update']}` failed: {out}"))
+    elif channel == "copy" and cli_route == "skills":
+        print(f"{label} refreshed by the skills manager above")
+    else:
+        print(f"{label} run: {skill['update']}")
+
+
+def _upgrade_command(argv: list[str]) -> int:
+    """`image-use upgrade [--check] [--json]` (alias: `update`).
+
+    Reserving these words as a subcommand also keeps `image-use upgrade` from
+    silently becoming an image prompt. Exit 0 on success (upgraded, already
+    current, or a check that ran), 2 when the check or download failed."""
+    parser = argparse.ArgumentParser(
+        prog="image-use upgrade",
+        description="Install the latest image-use release and refresh the skill.")
+    parser.add_argument("--check", action="store_true",
+                        help="only report current -> latest; change nothing")
+    parser.add_argument("--json", action="store_true",
+                        help="like --check, as JSON")
+    args = parser.parse_args(argv)
+
+    latest = _fetch_latest_release()
+    if latest:
+        _write_update_cache(time.time(), latest)
+    available = _is_newer(latest)
+    skills = _find_skill_installs()
+
+    if args.json:
+        out = {"name": "image-use", "current": __version__, "latest": latest,
+               "update_available": available, "skills": skills}
+        if latest is None:
+            out["error"] = "could not read the latest release from GitHub"
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if latest else 2
+    if latest is None:
+        print(f"error: could not read the latest release from {UPDATE_RELEASES_URL}",
+              file=sys.stderr)
+        return 2
+    print(f"image-use {__version__} -> {latest}" if available
+          else f"image-use {__version__} is up to date")
+    if args.check:
+        for skill in skills:
+            print(f"skill [{skill['channel']}] {skill['path']} "
+                  f"(refresh: {skill['update']})")
+        return 0
+
+    route, where = _cli_install_route()
+    rc = 0
+    if available:
+        for ver, note in _changes_since(_fetch_whatsnew(latest))[:10]:
+            print(f"  • {ver}: {note}")
+        rc = _install_cli(route, where, latest)
+    for skill in skills:
+        _refresh_skill(skill, route, where)
+    if rc == 0 and available:
+        print(f"upgraded to {latest} (this process is still {__version__}; "
+              f"the next run uses the new version)")
     return rc
 
 
 def main() -> int:
+    # Once-a-day "new version" notice: stderr only, so stdout (the saved path,
+    # JSON) stays exactly what callers parse.
+    if _should_check_for_update(sys.argv[1:]):
+        _maybe_notify_update()
     if len(sys.argv) > 1 and sys.argv[1] in ("style", "styles"):
         return _style_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "upload":
         return _upload_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         return _doctor_command(sys.argv[2:])
-    if len(sys.argv) > 1 and sys.argv[1] in ("update", "upgrade"):
-        return _self_update()
+    if len(sys.argv) > 1 and sys.argv[1] in ("upgrade", "update"):
+        return _upgrade_command(sys.argv[2:])
     argv = sys.argv[1:]
     animate_mode = bool(argv and argv[0] == "animate")
     if animate_mode:
@@ -6010,14 +6270,6 @@ def main() -> int:
             f"warning: more than {REF_ATTACH_CAP} reference images resolved; "
             f"attaching the first {REF_ATTACH_CAP} (character-first), dropped: "
             f"{names}"), file=sys.stderr)
-
-    # Once-a-day auto-update for interactive runs. Stderr only (stdout stays
-    # exactly the saved path), and skipped under --quiet/--no-progress so machine
-    # callers stay deterministic. `doctor` checks unconditionally for a deliberate
-    # look; failures here degrade to the previous one-line update notice.
-    if progress and not args.quiet:
-        _maybe_notify_update(
-            lambda m: print(_yellow(m), file=sys.stderr), auto_update=True)
 
     if progress:
         prompt_preview = f"{args.prompt[:60]}{'…' if len(args.prompt) > 60 else ''}"

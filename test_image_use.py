@@ -94,152 +94,196 @@ class VersionTuple(unittest.TestCase):
                         cig._version_tuple(cig.AB_MIN_VERSION))
 
 
-class UpdateNotify(unittest.TestCase):
-    """The once-a-day self-update reminder: throttle, cache, env-disable, parse,
-    and the what's-new changelog surfaced in the notice."""
+_NO_CHECK_ENV = ("CI", "USE_NO_UPDATE_CHECK", "IMAGE_USE_NO_UPDATE_CHECK",
+                 "CHATGPT_IMAGEGEN_NO_UPDATE_CHECK")
+
+
+@contextmanager
+def _update_env(**extra):
+    """A temp XDG_CACHE_HOME with every opt-out variable cleared (CI sets `CI`),
+    plus ``extra``. The network is never reached: callers patch the fetch."""
+    with tempfile.TemporaryDirectory() as d:
+        env = {k: v for k, v in os.environ.items() if k not in _NO_CHECK_ENV}
+        env["XDG_CACHE_HOME"] = d
+        env.update(extra)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            yield Path(d)
+
+
+class _FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class UpdateCheck(unittest.TestCase):
+    """The once-a-day notice: version comparison, 24 h throttle, opt-outs,
+    one line on stderr only — and no network (the fetch is patched)."""
 
     @contextmanager
-    def _patched_fetch(self, version, notes=None, counter=None):
-        orig = cig._fetch_latest_info
-
-        def fake(timeout=4.0):
+    def _patched_fetch(self, version, counter=None):
+        def fake(timeout=cig.UPDATE_FETCH_TIMEOUT):
             if counter is not None:
-                counter["n"] += 1
-            return version, (notes or {})
-        cig._fetch_latest_info = fake
-        try:
+                counter.append(timeout)
+            return version
+        with unittest.mock.patch.object(cig, "_fetch_latest_release", fake):
             yield
-        finally:
-            cig._fetch_latest_info = orig
 
-    def test_notifies_when_newer(self):
-        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "shiny new thing"}):
-            msgs = []
-            cig._maybe_notify_update(msgs.append)
-            self.assertTrue(msgs and "9.9.9" in msgs[0])
+    def test_version_comparison(self):
+        self.assertTrue(cig._is_newer("0.30.0", "0.29.2"))
+        self.assertTrue(cig._is_newer("0.29.10", "0.29.9"))
+        self.assertTrue(cig._is_newer("1.0.0", "0.99.99"))
+        self.assertFalse(cig._is_newer("0.29.2", "0.29.2"))
+        self.assertFalse(cig._is_newer("0.29.1", "0.29.2"))
+        self.assertFalse(cig._is_newer(None, "0.29.2"))
 
-    def test_notice_lists_what_changed(self):
-        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "shiny new thing"}):
-            msgs = []
-            cig._maybe_notify_update(msgs.append)
-            self.assertIn("shiny new thing", msgs[0])
+    def test_release_tag_parsing(self):
+        self.assertEqual(cig._release_version("v0.30.0"), "0.30.0")
+        self.assertEqual(cig._release_version("0.30.0"), "0.30.0")
+        self.assertIsNone(cig._release_version("nightly"))
+        self.assertIsNone(cig._release_version(None))
+
+    def test_fetch_reads_release_api_and_honours_github_token(self):
+        seen = []
+
+        def fake_urlopen(req, timeout):
+            seen.append((req.full_url, req.get_header("Authorization"), timeout))
+            return _FakeResponse(json.dumps(
+                {"tag_name": "v9.9.9", "prerelease": False}).encode())
+
+        with _update_env(GITHUB_TOKEN="placeholder-token"), \
+             unittest.mock.patch.object(cig.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(cig._fetch_latest_release(2.0), "9.9.9")
+        self.assertEqual(seen, [(cig.UPDATE_RELEASES_URL,
+                                 "Bearer placeholder-token", 2.0)])
+
+    def test_fetch_failure_is_none(self):
+        def boom(*a, **k):
+            raise cig.urllib.error.URLError("offline")
+        with unittest.mock.patch.object(cig.urllib.request, "urlopen", boom):
+            self.assertIsNone(cig._fetch_latest_release(2.0))
+
+    def test_prerelease_is_ignored(self):
+        body = json.dumps({"tag_name": "v9.9.9", "prerelease": True}).encode()
+        with unittest.mock.patch.object(cig.urllib.request, "urlopen",
+                                        lambda *a, **k: _FakeResponse(body)):
+            self.assertIsNone(cig._fetch_latest_release(2.0))
+
+    def test_notice_is_one_line_on_stderr_only(self):
+        with _update_env(), self._patched_fetch("9.9.9"):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                cig._maybe_notify_update()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(
+            err.getvalue(),
+            f"image-use 9.9.9 is available (you have {cig.__version__}). "
+            "Upgrade: image-use upgrade\n")
 
     def test_silent_when_same_or_older(self):
-        with _tmp_xdg(), self._patched_fetch(cig.__version__):
+        with _update_env(), self._patched_fetch(cig.__version__):
             msgs = []
             cig._maybe_notify_update(msgs.append)
-            self.assertEqual(msgs, [])
+        self.assertEqual(msgs, [])
 
-    def test_throttled_no_network_within_interval(self):
-        with _tmp_xdg():
-            counter = {"n": 0}
-            with self._patched_fetch("9.9.9", {"9.9.9": "x"}, counter):
-                cig._maybe_notify_update(lambda _m: None)        # first: hits network
-                cig._maybe_notify_update(lambda _m: None)        # second: cached
-            self.assertEqual(counter["n"], 1)
+    def test_uses_2s_timeout_and_writes_cache(self):
+        with _update_env() as cache_home:
+            calls = []
+            with self._patched_fetch("9.9.9", calls):
+                cig._maybe_notify_update(lambda _m: None)
+            self.assertEqual(calls, [2.0])
+            data = json.loads(
+                (cache_home / "image-use" / "update-check.json").read_text())
+        self.assertEqual(data["latest"], "9.9.9")
+        self.assertAlmostEqual(data["checked_at"], time.time(), delta=60)
 
-    def test_uses_cached_latest_when_throttled(self):
-        with _tmp_xdg():
-            with self._patched_fetch("9.9.9", {"9.9.9": "cached note"}):
-                cig._maybe_notify_update(lambda _m: None)        # populate cache
-            # Network would now report an older version, but throttle keeps cached 9.9.9.
-            with self._patched_fetch("0.0.1", {"0.0.1": "stale"}):
+    def test_throttled_within_24h(self):
+        with _update_env():
+            calls = []
+            with self._patched_fetch("9.9.9", calls):
+                cig._maybe_notify_update(lambda _m: None)      # hits the network
+                msgs = []
+                cig._maybe_notify_update(msgs.append)          # served from cache
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(msgs and "9.9.9" in msgs[0])
+
+    def test_rechecks_after_24h(self):
+        with _update_env() as cache_home:
+            cache = cache_home / "image-use" / "update-check.json"
+            cache.parent.mkdir(parents=True)
+            cache.write_text(json.dumps(
+                {"checked_at": time.time() - 86400 - 5, "latest": "0.0.1"}))
+            calls = []
+            with self._patched_fetch("9.9.9", calls):
                 msgs = []
                 cig._maybe_notify_update(msgs.append)
-            self.assertTrue(msgs and "9.9.9" in msgs[0] and "cached note" in msgs[0])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(msgs and "9.9.9" in msgs[0])
 
-    def test_env_disable_is_noop(self):
-        with _tmp_xdg():
-            counter = {"n": 0}
-            os.environ["CHATGPT_IMAGEGEN_NO_UPDATE_CHECK"] = "1"
-            try:
-                with self._patched_fetch("9.9.9", {"9.9.9": "x"}, counter):
-                    msgs = []
+    def test_failed_check_is_silent_and_still_stamps_checked_at(self):
+        with _update_env() as cache_home:
+            calls = []
+            with self._patched_fetch(None, calls):
+                msgs = []
+                cig._maybe_notify_update(msgs.append)
+                cig._maybe_notify_update(msgs.append)          # not retried
+            data = json.loads(
+                (cache_home / "image-use" / "update-check.json").read_text())
+        self.assertEqual((len(calls), msgs), (1, []))
+        self.assertIsNone(data["latest"])
+
+    def test_failed_check_keeps_last_known_version(self):
+        with _update_env() as cache_home:
+            cache = cache_home / "image-use" / "update-check.json"
+            cache.parent.mkdir(parents=True)
+            cache.write_text(json.dumps({"checked_at": 0, "latest": "9.9.9"}))
+            with self._patched_fetch(None):
+                msgs = []
+                cig._maybe_notify_update(msgs.append)
+        self.assertTrue(msgs and "9.9.9" in msgs[0])
+
+    def test_opt_out_env_vars(self):
+        for var in ("CI", "USE_NO_UPDATE_CHECK", "IMAGE_USE_NO_UPDATE_CHECK",
+                    "CHATGPT_IMAGEGEN_NO_UPDATE_CHECK"):
+            with self.subTest(var=var), _update_env(**{var: "1"}) as cache_home:
+                calls, msgs = [], []
+                with self._patched_fetch("9.9.9", calls):
                     cig._maybe_notify_update(msgs.append)
-            finally:
-                os.environ.pop("CHATGPT_IMAGEGEN_NO_UPDATE_CHECK", None)
-            self.assertEqual((counter["n"], msgs), (0, []))
+                self.assertEqual((calls, msgs), ([], []))
+                self.assertFalse((cache_home / "image-use").exists())
 
-    def test_interactive_run_auto_updates_newer_version(self):
-        class _Res:
-            returncode = 0
+    def test_skipped_for_upgrade_version_and_help(self):
+        for argv in (["upgrade"], ["upgrade", "--json"], ["update"], ["doctor"],
+                     ["--version"], ["-V"], ["--help"], ["-h"],
+                     ["a cat", "--help"], ["style", "list", "-h"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(cig._should_check_for_update(argv))
+        for argv in ([], ["a cat"], ["style", "list"], ["a cat", "--", "--help"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(cig._should_check_for_update(argv))
 
-        calls = []
-
-        def fake_run(argv, *args, **kwargs):
-            calls.append((argv, kwargs))
-            return _Res()
-
-        with _tmp_xdg(), \
-             self._patched_fetch("9.9.9", {"9.9.9": "shiny new thing"}), \
-             unittest.mock.patch.object(cig, "_update_runner",
-                                        return_value=["skills", "update", "image-use"]), \
-             unittest.mock.patch.object(cig, "_installed_script_version",
-                                        return_value="9.9.9"), \
-             unittest.mock.patch.object(cig.subprocess, "run", fake_run):
-            msgs = []
-            cig._maybe_notify_update(msgs.append, auto_update=True)
-
-        self.assertEqual(calls[0][0], ["skills", "update", "image-use"])
-        self.assertIs(calls[0][1]["stdout"], cig.subprocess.DEVNULL)
-        self.assertIn("正在自动升级", msgs[0])
-        self.assertIn("已自动升级到 v9.9.9", msgs[1])
-        self.assertNotIn("更新:image-use update", "\n".join(msgs))
-
-    def test_auto_update_failure_falls_back_to_notice(self):
-        class _Res:
-            returncode = 1
-
-        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
-             unittest.mock.patch.object(cig, "_update_runner",
-                                        return_value=["skills", "update", "image-use"]), \
-             unittest.mock.patch.object(cig.subprocess, "run", return_value=_Res()):
-            msgs = []
-            cig._maybe_notify_update(msgs.append, auto_update=True)
-
-        self.assertIn("正在自动升级", msgs[0])
-        self.assertIn("更新:image-use update", msgs[-1])
-
-    def test_update_that_does_not_replace_this_cli_falls_back_to_notice(self):
-        class _Res:
-            returncode = 0
-
-        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
-             unittest.mock.patch.object(cig, "_update_runner",
-                                        return_value=["skills", "update", "image-use"]), \
-             unittest.mock.patch.object(cig, "_installed_script_version",
+    def test_main_upgrade_check_does_not_run_notice(self):
+        with _update_env(), \
+             unittest.mock.patch.object(cig.sys, "argv",
+                                        ["image-use", "upgrade", "--check"]), \
+             unittest.mock.patch.object(cig, "_maybe_notify_update") as notify, \
+             unittest.mock.patch.object(cig, "_fetch_latest_release",
                                         return_value=cig.__version__), \
-             unittest.mock.patch.object(cig.subprocess, "run", return_value=_Res()):
-            msgs = []
-            cig._maybe_notify_update(msgs.append, auto_update=True)
-
-        self.assertIn("更新:image-use update", msgs[-1])
-
-    def test_no_auto_update_keeps_notice_without_running(self):
-        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
-             unittest.mock.patch.dict(
-                 os.environ, {"CHATGPT_IMAGEGEN_NO_AUTO_UPDATE": "1"}), \
-             unittest.mock.patch.object(cig, "_update_runner") as runner:
-            msgs = []
-            cig._maybe_notify_update(msgs.append, auto_update=True)
-
-        runner.assert_not_called()
-        self.assertIn("更新:image-use update", msgs[0])
+             unittest.mock.patch.object(cig, "_find_skill_installs", return_value=[]):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cig.main(), 0)
+        notify.assert_not_called()
 
     def test_changes_since_filters_and_orders(self):
         notes = {"0.1.0": "old", "9.9.0": "mid", "9.9.9": "new"}
         self.assertEqual(cig._changes_since(notes, base="9.8.0"),
                          [("9.9.9", "new"), ("9.9.0", "mid")])
 
-    def test_format_notice_caps_lines(self):
-        notes = {f"9.0.{i}": f"change {i}" for i in range(1, 6)}
-        out = cig._format_update_notice("9.0.5", notes, max_lines=3)
-        self.assertEqual(out.count("\n  •"), 4)          # 3 changes + "另有 N 项"
-        self.assertIn("另有 2 项", out)
-
     def test_parse_whatsnew_from_real_header(self):
-        # Both __version__ and the newest WHATSNEW line must sit in the first 8KB,
-        # since the reminder only reads that prefix of the remote script.
+        # `upgrade` reads what changed from the first 8KB of the CLI at the
+        # release tag, so __version__ and its WHATSNEW line must sit there.
         head = Path(os.path.join(os.path.dirname(__file__),
                                  "image-use")).read_text(encoding="utf-8")[:8192]
         m = re.search(r'__version__\s*=\s*"([\d.]+)"', head)
@@ -249,92 +293,248 @@ class UpdateNotify(unittest.TestCase):
         self.assertTrue(notes[cig.__version__])
 
 
-class SelfUpdate(unittest.TestCase):
-    """`update` / `upgrade` shells out to `skills update` instead of drawing."""
+class Upgrade(unittest.TestCase):
+    """`upgrade` / `update`: --check, --json, exit codes, install routes and
+    skill refresh — all against a temp HOME with the network patched."""
+
+    @contextmanager
+    def _home(self):
+        with tempfile.TemporaryDirectory() as home, _update_env():
+            with unittest.mock.patch.object(cig.Path, "home",
+                                            return_value=Path(home)):
+                yield Path(home)
+
+    def _run(self, argv, latest):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(cig, "_fetch_latest_release",
+                                        return_value=latest), \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = cig._upgrade_command(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_check_update_available(self):
+        with self._home():
+            rc, out, _ = self._run(["--check"], "9.9.9")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0], f"image-use {cig.__version__} -> 9.9.9")
+
+    def test_check_up_to_date(self):
+        with self._home():
+            rc, out, _ = self._run(["--check"], cig.__version__)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), f"image-use {cig.__version__} is up to date")
+
+    def test_check_failure_exits_2(self):
+        with self._home():
+            rc, out, err = self._run(["--check"], None)
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("could not read the latest release", err)
+
+    def test_json_shape(self):
+        with self._home() as home:
+            plugins = home / ".claude" / "plugins"
+            plugins.mkdir(parents=True)
+            (plugins / "installed_plugins.json").write_text(json.dumps(
+                {"version": 2, "plugins": {
+                    "image-use@leeguooooo-plugins": [
+                        {"installPath": str(home / "cache" / "image-use")}],
+                    "other@leeguooooo-plugins": [{"installPath": "/x"}]}}))
+            copy = home / ".agents" / "skills" / "image-use"
+            copy.mkdir(parents=True)
+            (copy / "SKILL.md").write_text("---\nname: image-use\n---\n")
+            (home / ".claude" / "skills").mkdir(parents=True)
+            (home / ".claude" / "skills" / "image-use").symlink_to(copy)
+            with unittest.mock.patch.object(cig, "_git_toplevel", return_value=None):
+                rc, out, _ = self._run(["--json"], "9.9.9")
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(data, {
+            "name": "image-use", "current": cig.__version__, "latest": "9.9.9",
+            "update_available": True,
+            "skills": [
+                {"channel": "claude-plugin",
+                 "path": str(home / "cache" / "image-use"),
+                 "update": "claude plugin update image-use@leeguooooo-plugins"},
+                {"channel": "copy", "path": str(copy.resolve()),
+                 "update": "npx skills update image-use"},
+            ]})
+
+    def test_json_failure_exits_2_with_valid_json(self):
+        with self._home():
+            rc, out, _ = self._run(["--json"], None)
+        data = json.loads(out)
+        self.assertEqual(rc, 2)
+        self.assertIsNone(data["latest"])
+        self.assertFalse(data["update_available"])
+
+    def test_git_checkout_skill_is_detected_only_at_its_root(self):
+        with self._home() as home:
+            clone = home / "src" / "image-use"
+            clone.mkdir(parents=True)
+            (clone / "SKILL.md").write_text("x")
+            (home / ".agents" / "skills").mkdir(parents=True)
+            (home / ".agents" / "skills" / "image-use").symlink_to(clone)
+            with unittest.mock.patch.object(cig, "_git_toplevel",
+                                            return_value=clone.resolve()):
+                found = cig._find_skill_installs()
+            # A copy that merely sits inside some other repo is not a clone.
+            with unittest.mock.patch.object(cig, "_git_toplevel",
+                                            return_value=home.resolve()):
+                found_nested = cig._find_skill_installs()
+        self.assertEqual(found, [{"channel": "git", "path": str(clone.resolve()),
+                                  "update": f"git -C {clone.resolve()} pull --ff-only"}])
+        self.assertEqual(found_nested[0]["channel"], "copy")
+
+    def test_upgrade_runs_route_then_refreshes_skills(self):
+        skills = [{"channel": "git", "path": "/s/image-use",
+                   "update": "git -C /s/image-use pull --ff-only"},
+                  {"channel": "claude-plugin", "path": "/p",
+                   "update": "claude plugin update image-use@leeguooooo-plugins"},
+                  {"channel": "copy", "path": "/c",
+                   "update": "npx skills update image-use"}]
+        steps = []
+
+        def fake_step(argv, cwd=None):
+            steps.append(argv)
+            return 0, ""
+
+        with self._home(), \
+             unittest.mock.patch.object(cig, "_find_skill_installs", return_value=skills), \
+             unittest.mock.patch.object(cig, "_cli_install_route",
+                                        return_value=("file", Path("/bin/image-use"))), \
+             unittest.mock.patch.object(cig, "_replace_script", return_value=0) as repl, \
+             unittest.mock.patch.object(cig, "_fetch_whatsnew",
+                                        return_value={"9.9.9": "new thing"}), \
+             unittest.mock.patch.object(cig, "_run_step", fake_step), \
+             unittest.mock.patch.object(cig.shutil, "which",
+                                        lambda n: f"/usr/bin/{n}"):
+            rc, out, _ = self._run([], "9.9.9")
+        self.assertEqual(rc, 0)
+        repl.assert_called_once_with(Path("/bin/image-use"), "9.9.9")
+        self.assertEqual(steps, [
+            ["git", "-C", "/s/image-use", "pull", "--ff-only"],
+            ["/usr/bin/claude", "plugin", "update", "image-use@leeguooooo-plugins"]])
+        self.assertIn("9.9.9: new thing", out)
+        self.assertIn("run: npx skills update image-use", out)   # printed, not run
+        self.assertIn("upgraded to 9.9.9", out)
+
+    def test_plugin_refresh_prints_command_without_claude(self):
+        skill = {"channel": "claude-plugin", "path": "/p",
+                 "update": "claude plugin update image-use@leeguooooo-plugins"}
+        with unittest.mock.patch.object(cig.shutil, "which", return_value=None), \
+             unittest.mock.patch.object(cig, "_run_step") as step:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cig._refresh_skill(skill, "file", Path("/x"))
+        step.assert_not_called()
+        self.assertIn("run: claude plugin update image-use@leeguooooo-plugins",
+                      out.getvalue())
+
+    def test_git_pull_failure_is_reported_not_forced(self):
+        skill = {"channel": "git", "path": "/s", "update": "git -C /s pull --ff-only"}
+        with unittest.mock.patch.object(cig, "_run_step",
+                                        return_value=(1, "Not possible to fast-forward")):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                cig._refresh_skill(skill, "file", Path("/x"))
+        self.assertIn("not updated", out.getvalue())
+        self.assertIn("Not possible to fast-forward", out.getvalue())
+
+    def test_up_to_date_installs_nothing(self):
+        with self._home(), \
+             unittest.mock.patch.object(cig, "_find_skill_installs", return_value=[]), \
+             unittest.mock.patch.object(cig, "_install_cli") as install:
+            rc, out, _ = self._run([], cig.__version__)
+        self.assertEqual(rc, 0)
+        install.assert_not_called()
+        self.assertIn("is up to date", out)
+
+    def test_replace_script_swaps_file_for_release(self):
+        body = (b'#!/usr/bin/env python3\n__version__ = "9.9.9"\n')
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "image-use"
+            target.write_text("old")
+            with unittest.mock.patch.object(cig.urllib.request, "urlopen",
+                                            lambda *a, **k: _FakeResponse(body)):
+                rc = cig._replace_script(target, "9.9.9")
+            self.assertEqual(rc, 0)
+            self.assertEqual(target.read_bytes(), body)
+            self.assertTrue(os.access(target, os.X_OK))
+
+    def test_replace_script_rejects_wrong_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "image-use"
+            target.write_text("old")
+            with unittest.mock.patch.object(
+                    cig.urllib.request, "urlopen",
+                    lambda *a, **k: _FakeResponse(b"<html>not found</html>")), \
+                 redirect_stderr(io.StringIO()):
+                rc = cig._replace_script(target, "9.9.9")
+            self.assertEqual(rc, 2)
+            self.assertEqual(target.read_text(), "old")
+
+    def test_route_detection(self):
+        with tempfile.TemporaryDirectory() as d:
+            plugin = Path(d) / ".claude" / "plugins" / "cache" / "x" / "image-use"
+            skill = Path(d) / "skills" / "image-use"
+            loose = Path(d) / "bin"
+            for folder in (plugin, skill, loose):
+                folder.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("x")
+            with unittest.mock.patch.object(cig, "_git_toplevel", return_value=None):
+                for folder, route in ((plugin, "claude-plugin"), (skill, "skills"),
+                                      (loose, "file")):
+                    with unittest.mock.patch.object(cig, "__file__",
+                                                    str(folder / "image-use")):
+                        self.assertEqual(cig._cli_install_route()[0], route)
+            with unittest.mock.patch.object(cig, "_git_toplevel",
+                                            return_value=skill.resolve()), \
+                 unittest.mock.patch.object(cig, "__file__", str(skill / "image-use")):
+                self.assertEqual(cig._cli_install_route()[0], "git")
+
+
+class SkillsRoute(unittest.TestCase):
+    """A skill-folder install upgrades through `skills update`, via npx when
+    `skills` itself is not on PATH."""
+
+    def _install(self, which, run_rc=0):
+        calls = []
+
+        class _Res:
+            returncode = run_rc
+
+        def fake_run(argv, *a, **k):
+            calls.append(argv)
+            return _Res()
+
+        with unittest.mock.patch.object(cig.shutil, "which", which), \
+             unittest.mock.patch.object(cig.subprocess, "run", fake_run), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = cig._install_cli("skills", Path("/s"), "9.9.9")
+        return rc, calls, err.getvalue()
 
     def test_runs_skills_update(self):
-        calls = []
-
-        class _Res:
-            returncode = 0
-
-        def fake_run(argv, *a, **k):
-            calls.append(argv)
-            return _Res()
-
-        with unittest.mock.patch.object(cig.shutil, "which",
-                                        return_value="/usr/bin/skills"), \
-             unittest.mock.patch.object(cig.subprocess, "run", fake_run), \
-             unittest.mock.patch.object(cig, "_fetch_latest_info",
-                                        return_value=(None, {})):
-            rc = cig._self_update()
-        self.assertEqual(rc, 0)
-        self.assertEqual(calls,
-                         [["/usr/bin/skills", "update", "image-use"]])
+        rc, calls, _ = self._install(lambda n: "/usr/bin/skills")
+        self.assertEqual((rc, calls), (0, [["/usr/bin/skills", "update", "image-use"]]))
 
     def test_missing_skills_falls_back_to_npx(self):
-        """`skills` is usually only reachable via npx — that must not be a dead end."""
-        calls = []
-
-        class _Res:
-            returncode = 0
-
-        def fake_which(name):
-            return "/usr/bin/npx" if name == "npx" else None
-
-        def fake_run(argv, *a, **k):
-            calls.append(argv)
-            return _Res()
-
-        with unittest.mock.patch.object(cig.shutil, "which", fake_which), \
-             unittest.mock.patch.object(cig.subprocess, "run", fake_run), \
-             unittest.mock.patch.object(cig, "_fetch_latest_info",
-                                        return_value=(None, {})):
-            rc = cig._self_update()
-        self.assertEqual(rc, 0)
+        rc, calls, _ = self._install(
+            lambda n: "/usr/bin/npx" if n == "npx" else None)
         self.assertEqual(
-            calls,
-            [["/usr/bin/npx", "-y", "skills", "update", "image-use"]])
+            (rc, calls), (0, [["/usr/bin/npx", "-y", "skills", "update", "image-use"]]))
 
     def test_path_skills_wins_over_npx(self):
-        """A real `skills` on PATH is cheaper than spinning up npx."""
-        calls = []
-
-        class _Res:
-            returncode = 0
-
-        def fake_run(argv, *a, **k):
-            calls.append(argv)
-            return _Res()
-
-        with unittest.mock.patch.object(cig.shutil, "which",
-                                        lambda name: f"/usr/bin/{name}"), \
-             unittest.mock.patch.object(cig.subprocess, "run", fake_run), \
-             unittest.mock.patch.object(cig, "_fetch_latest_info",
-                                        return_value=(None, {})):
-            cig._self_update()
-        self.assertEqual(calls,
-                         [["/usr/bin/skills", "update", "image-use"]])
+        _, calls, _ = self._install(lambda n: f"/usr/bin/{n}")
+        self.assertEqual(calls, [["/usr/bin/skills", "update", "image-use"]])
 
     def test_no_runner_at_all_prints_command_and_fails(self):
-        with unittest.mock.patch.object(cig.shutil, "which", return_value=None):
-            buf = io.StringIO()
-            with redirect_stderr(buf):
-                rc = cig._self_update()
-        self.assertEqual(rc, 1)
-        self.assertIn("npx -y skills update image-use", buf.getvalue())
+        rc, calls, err = self._install(lambda n: None)
+        self.assertEqual((rc, calls), (1, []))
+        self.assertIn("npx -y skills update image-use", err)
 
     def test_propagates_nonzero_exit(self):
-        class _Res:
-            returncode = 3
-
-        with unittest.mock.patch.object(cig.shutil, "which",
-                                        return_value="/usr/bin/skills"), \
-             unittest.mock.patch.object(cig.subprocess, "run",
-                                        return_value=_Res()), \
-             unittest.mock.patch.object(cig, "_fetch_latest_info",
-                                        return_value=(None, {})):
-            self.assertEqual(cig._self_update(), 3)
+        rc, _, _ = self._install(lambda n: "/usr/bin/skills", run_rc=3)
+        self.assertEqual(rc, 3)
 
 
 class IsUrl(unittest.TestCase):
