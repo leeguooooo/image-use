@@ -4701,7 +4701,7 @@ def _fetch_latest_release_bounded(timeout: float) -> str | None:
     t = threading.Thread(target=lambda: box.append(_fetch_latest_release(timeout)),
                          daemon=True)
     t.start()
-    t.join(timeout + 0.5)
+    t.join(timeout)
     return box[0] if box else None
 
 
@@ -5678,6 +5678,18 @@ def _git_checkout_root(path: Path) -> Path | None:
         return None
 
 
+def _git_is_this_repo(path: Path) -> bool:
+    """True when a remote of the clone at ``path`` is image-use (or its
+    pre-rename name chatgpt-imagegen)."""
+    try:
+        r = subprocess.run(["git", "-C", str(path), "remote", "-v"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and bool(re.search(
+        r"[/:]leeguooooo/(image-use|chatgpt-imagegen)(\.git)?\s", r.stdout))
+
+
 def _is_plugin_path(path: Path) -> bool:
     parts = path.parts
     return any(a == ".claude" and b == "plugins" for a, b in zip(parts, parts[1:]))
@@ -5745,9 +5757,9 @@ def _cli_install_route() -> tuple[str, Path]:
     folder = here.parent
     if _is_plugin_path(here):
         return "claude-plugin", folder
-    # Only a clone of this repo (SKILL.md sits at its root): a lone script in
-    # e.g. a dotfiles-managed ~/bin repo must not get that repo pulled.
-    if (folder / "SKILL.md").is_file() and _git_checkout_root(folder) is not None:
+    # Only a clone of THIS repo: a script sitting at the root of some other
+    # repo (a dotfiles-managed ~/bin, say) must never get that repo pulled.
+    if _git_checkout_root(folder) is not None and _git_is_this_repo(folder):
         return "git", folder
     if (folder / "SKILL.md").is_file():
         return "skills", folder
@@ -5904,6 +5916,12 @@ def _upgrade_command(argv: list[str]) -> int:
             # A pull follows the checkout's branch, which may be past the tag.
             print(f"pulled {where} (it follows its branch; the latest release "
                   f"is {latest}); the next run uses the new code")
+        elif route == "claude-plugin":
+            # `claude plugin update` installs what the marketplace lists,
+            # which can lag the GitHub release.
+            print(f"refreshed the Claude Code plugin (it installs the version the "
+                  f"marketplace lists, which can trail release {latest}); "
+                  f"check with `image-use --version`")
         else:
             print(f"upgraded to {latest} (this process is still {__version__}; "
                   f"the next run uses the new version)")

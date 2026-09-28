@@ -505,8 +505,16 @@ class Upgrade(unittest.TestCase):
                         self.assertEqual(cig._cli_install_route()[0], route)
             with unittest.mock.patch.object(cig, "_git_toplevel",
                                             return_value=skill.resolve()), \
+                 unittest.mock.patch.object(cig, "_git_is_this_repo", return_value=True), \
                  unittest.mock.patch.object(cig, "__file__", str(skill / "image-use")):
                 self.assertEqual(cig._cli_install_route()[0], "git")
+            # Some other repo that happens to hold SKILL.md + the script:
+            # keep the skills route, never pull it.
+            with unittest.mock.patch.object(cig, "_git_toplevel",
+                                            return_value=skill.resolve()), \
+                 unittest.mock.patch.object(cig, "_git_is_this_repo", return_value=False), \
+                 unittest.mock.patch.object(cig, "__file__", str(skill / "image-use")):
+                self.assertEqual(cig._cli_install_route()[0], "skills")
 
     def test_lone_script_at_root_of_unrelated_repo_is_a_file_route(self):
         # e.g. ~/bin is a dotfiles repo: never `git pull` it.
@@ -515,6 +523,7 @@ class Upgrade(unittest.TestCase):
             loose.mkdir()
             with unittest.mock.patch.object(cig, "_git_toplevel",
                                             return_value=loose.resolve()), \
+                 unittest.mock.patch.object(cig, "_git_is_this_repo", return_value=False), \
                  unittest.mock.patch.object(cig, "__file__", str(loose / "image-use")):
                 self.assertEqual(cig._cli_install_route()[0], "file")
 
