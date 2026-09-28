@@ -5796,8 +5796,9 @@ def _install_cli(route: str, where: Path, latest: str) -> int:
     return _replace_script(where, latest)
 
 
-def _refresh_skill(skill: dict, cli_route: str, cli_where: Path) -> None:
-    """Step 2 of `upgrade`: refresh one installed skill copy."""
+def _refresh_skill(skill: dict, cli_route: str, cli_where: Path) -> int:
+    """Step 2 of `upgrade`: refresh one installed skill copy. 1 when a
+    refresh it ran failed, else 0 (printing a command is not a failure)."""
     channel, path = skill["channel"], skill["path"]
     label = f"skill [{channel}] {path}:"
     if channel == "git" and cli_route == "git" and Path(path) == cli_where:
@@ -5806,18 +5807,21 @@ def _refresh_skill(skill: dict, cli_route: str, cli_where: Path) -> None:
         rc, out = _run_step(["git", "-C", path, "pull", "--ff-only"])
         print(f"{label} " + ("pulled" if rc == 0
                              else f"not updated (git pull --ff-only failed: {out})"))
+        return 1 if rc else 0
     elif channel == "claude-plugin":
         claude = shutil.which("claude")
         if claude is None:
             print(f"{label} run: {skill['update']}")
-            return
+            return 0
         rc, out = _run_step([claude, *skill["update"].split()[1:]])
         print(f"{label} " + ("updated" if rc == 0
                              else f"`{skill['update']}` failed: {out}"))
+        return 1 if rc else 0
     elif channel == "copy" and cli_route == "skills":
         print(f"{label} refreshed by the skills manager above")
     else:
         print(f"{label} run: {skill['update']}")
+    return 0
 
 
 def _upgrade_command(argv: list[str]) -> int:
@@ -5866,12 +5870,19 @@ def _upgrade_command(argv: list[str]) -> int:
         for ver, note in _changes_since(_fetch_whatsnew(latest))[:10]:
             print(f"  • {ver}: {note}")
         rc = _install_cli(route, where, latest)
+    refresh_failed = 0
     for skill in skills:
-        _refresh_skill(skill, route, where)
+        # Only a route that actually ran in step 1 can have refreshed a skill.
+        refresh_failed |= _refresh_skill(skill, route if available else "", where)
     if rc == 0 and available:
-        print(f"upgraded to {latest} (this process is still {__version__}; "
-              f"the next run uses the new version)")
-    return rc
+        if route == "git":
+            # A pull follows the checkout's branch, which may be past the tag.
+            print(f"pulled {where} (it follows its branch; the latest release "
+                  f"is {latest}); the next run uses the new code")
+        else:
+            print(f"upgraded to {latest} (this process is still {__version__}; "
+                  f"the next run uses the new version)")
+    return rc or refresh_failed
 
 
 def main() -> int:

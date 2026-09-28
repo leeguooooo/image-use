@@ -436,9 +436,24 @@ class Upgrade(unittest.TestCase):
                                         return_value=(1, "Not possible to fast-forward")):
             out = io.StringIO()
             with redirect_stdout(out):
-                cig._refresh_skill(skill, "file", Path("/x"))
+                rc = cig._refresh_skill(skill, "file", Path("/x"))
+        self.assertEqual(rc, 1)
         self.assertIn("not updated", out.getvalue())
         self.assertIn("Not possible to fast-forward", out.getvalue())
+
+    def test_up_to_date_still_pulls_the_clone(self):
+        # With nothing installed in step 1, a clone must not be reported as
+        # "pulled above" — it gets its own pull.
+        skill = {"channel": "git", "path": "/s", "update": "git -C /s pull --ff-only"}
+        with self._home(), \
+             unittest.mock.patch.object(cig, "_find_skill_installs", return_value=[skill]), \
+             unittest.mock.patch.object(cig, "_cli_install_route",
+                                        return_value=("git", Path("/s"))), \
+             unittest.mock.patch.object(cig, "_run_step", return_value=(0, "")) as step:
+            rc, out, _ = self._run([], cig.__version__)
+        self.assertEqual(rc, 0)
+        step.assert_called_once_with(["git", "-C", "/s", "pull", "--ff-only"])
+        self.assertIn("pulled", out)
 
     def test_up_to_date_installs_nothing(self):
         with self._home(), \
