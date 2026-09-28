@@ -4674,12 +4674,35 @@ def _write_update_cache(checked_at: float, latest: str | None) -> None:
     cache = _update_cache_path()
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_name(cache.name + ".tmp")
-        tmp.write_text(json.dumps({"checked_at": int(checked_at), "latest": latest}),
-                       encoding="utf-8")
-        os.replace(tmp, cache)
+        # A per-process temp name: concurrent runs must not interleave writes
+        # into one shared `.tmp` before the atomic rename.
+        fd, tmp = tempfile.mkstemp(prefix=cache.name + ".", suffix=".tmp",
+                                   dir=str(cache.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"checked_at": int(checked_at), "latest": latest}))
+            os.replace(tmp, cache)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:  # noqa: BLE001
         pass
+
+
+def _fetch_latest_release_bounded(timeout: float) -> str | None:
+    """`_fetch_latest_release` with a hard wall-clock cap. urlopen's timeout
+    covers socket reads but not DNS resolution, which can stall far longer on
+    a broken network — so the fetch runs in a daemon thread and is abandoned
+    (treated as a failure) once ``timeout`` seconds pass."""
+    box: list = []
+    t = threading.Thread(target=lambda: box.append(_fetch_latest_release(timeout)),
+                         daemon=True)
+    t.start()
+    t.join(timeout + 0.5)
+    return box[0] if box else None
 
 
 def _cached_latest(now: float | None = None) -> str | None:
@@ -4698,7 +4721,7 @@ def _cached_latest(now: float | None = None) -> str | None:
         latest = None
     if 0 <= now - last < UPDATE_CHECK_INTERVAL:
         return latest
-    fetched = _fetch_latest_release(UPDATE_NOTICE_TIMEOUT)
+    fetched = _fetch_latest_release_bounded(UPDATE_NOTICE_TIMEOUT)
     if fetched:
         latest = fetched
     _write_update_cache(now, latest)
@@ -5722,7 +5745,9 @@ def _cli_install_route() -> tuple[str, Path]:
     folder = here.parent
     if _is_plugin_path(here):
         return "claude-plugin", folder
-    if _git_checkout_root(folder) is not None:
+    # Only a clone of this repo (SKILL.md sits at its root): a lone script in
+    # e.g. a dotfiles-managed ~/bin repo must not get that repo pulled.
+    if (folder / "SKILL.md").is_file() and _git_checkout_root(folder) is not None:
         return "git", folder
     if (folder / "SKILL.md").is_file():
         return "skills", folder

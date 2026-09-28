@@ -21,6 +21,7 @@ import os
 import re
 import ssl
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from contextlib import contextmanager
@@ -506,6 +507,41 @@ class Upgrade(unittest.TestCase):
                                             return_value=skill.resolve()), \
                  unittest.mock.patch.object(cig, "__file__", str(skill / "image-use")):
                 self.assertEqual(cig._cli_install_route()[0], "git")
+
+    def test_lone_script_at_root_of_unrelated_repo_is_a_file_route(self):
+        # e.g. ~/bin is a dotfiles repo: never `git pull` it.
+        with tempfile.TemporaryDirectory() as d:
+            loose = Path(d) / "bin"
+            loose.mkdir()
+            with unittest.mock.patch.object(cig, "_git_toplevel",
+                                            return_value=loose.resolve()), \
+                 unittest.mock.patch.object(cig, "__file__", str(loose / "image-use")):
+                self.assertEqual(cig._cli_install_route()[0], "file")
+
+    def test_daily_fetch_is_wall_clock_bounded(self):
+        release = threading.Event()
+
+        def hang(timeout=cig.UPDATE_FETCH_TIMEOUT):
+            release.wait(5)  # e.g. a stalled DNS lookup urlopen can't time out
+            return "9.9.9"
+        try:
+            with unittest.mock.patch.object(cig, "_fetch_latest_release", hang):
+                t0 = time.monotonic()
+                self.assertIsNone(cig._fetch_latest_release_bounded(0.1))
+                self.assertLess(time.monotonic() - t0, 2)
+        finally:
+            release.set()
+
+    def test_cache_write_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d, \
+             unittest.mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}):
+            cig._write_update_cache(1.0, "1.2.3")
+            cig._write_update_cache(2.0, "1.2.4")
+            folder = Path(d) / "image-use"
+            self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                             ["update-check.json"])
+            self.assertEqual(json.loads((folder / "update-check.json").read_text()),
+                             {"checked_at": 2, "latest": "1.2.4"})
 
 
 class SkillsRoute(unittest.TestCase):
