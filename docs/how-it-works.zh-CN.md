@@ -28,7 +28,8 @@ image-use --backend web
    ├── 用真实键盘输入打提示词                       (ProseMirror/React 输入框不认纯 DOM 的 `fill`)
    ├── 轮询页面:等流结束 且 新的 <img> 资源稳定
    └── 在页面内 fetch 资源字节 (credentials:'include') → base64 → 存盘
-       (签名的 estuary/content URL 由浏览器自己的 cookie 授权)
+       (签名的 estuary/content URL 由浏览器自己的 cookie 授权;
+        2026-09 改版后图片是 blob: URL,只有页面自己能读)
 ```
 
 token 不出浏览器。每次出图落在 `imagegen` 项目里(自动创建),且**默认出图后删除该对话**不留历史(`--keep-conversation` 可保留);传 `--project ""` 可退回普通顶层对话。

@@ -1,0 +1,58 @@
+<!doctype html>
+<!-- chatgpt.com thread, 2026-09 redesign (issue #41), Chinese UI, after one
+     finished image generation. Built from the DOM the reporter recorded in #41
+     (their account is served the redesign; ours still gets the legacy layout,
+     see chatgpt-thread-legacy.html). No personal data: the prompt is a
+     placeholder and the blob: URL a zero UUID.
+     What changed from the legacy layout:
+       - composer: bare div.ProseMirror[contenteditable] in the <form>, no #prompt-textarea
+       - send: plain button[type=submit] with a localized label, no data-testid
+       - turns: div[data-turn-key] holding the user bubble and the assistant
+         heading; no [data-message-author-role] anywhere
+       - the whole thread is rendered twice (every data-turn-key appears 2x)
+       - result: blob: <img> in [data-testid=generated-image-preview] -->
+<html lang="zh-CN"><body>
+<main id="main">
+  <div id="thread">
+    <div data-thread-copy="1">
+      <div data-turn-key="turn-0001">
+        <div data-user-message-bubble="true">
+          <div>a simple flat illustration of a red apple on white background</div>
+        </div>
+        <h4 data-conversation-role="assistant">ChatGPT 说：</h4>
+        <div data-testid="generated-image-gallery">
+          <button type="button" data-testid="generated-image-preview" aria-label="打开图片">
+            <img alt="已生成的图片" width="1024" height="1024"
+                 src="blob:https://chatgpt.com/00000000-0000-0000-0000-000000000001">
+          </button>
+        </div>
+      </div>
+    </div>
+    <div data-thread-copy="2" aria-hidden="true">
+      <div data-turn-key="turn-0001">
+        <div data-user-message-bubble="true">
+          <div>a simple flat illustration of a red apple on white background</div>
+        </div>
+        <h4 data-conversation-role="assistant">ChatGPT 说：</h4>
+        <div data-testid="generated-image-gallery">
+          <button type="button" data-testid="generated-image-preview" aria-label="打开图片">
+            <img alt="已生成的图片" width="1024" height="1024"
+                 src="blob:https://chatgpt.com/00000000-0000-0000-0000-000000000001">
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <form autocomplete="off">
+    <input multiple type="file" id="upload-files">
+    <div>
+      <button type="button" aria-label="添加文件等">+</button>
+      <div class="ProseMirror" contenteditable="true" role="textbox" aria-multiline="true">
+        <p>a simple flat illustration of a red apple on white background</p>
+      </div>
+      <button type="button" aria-label="开始听写"></button>
+      <button type="submit" aria-label="发送"></button>
+    </div>
+  </form>
+</main>
+</body></html>

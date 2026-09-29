@@ -30,7 +30,8 @@ image-use --backend web
    ├── click Send once and confirm a new message  (never replay an uncertain send)
    ├── poll the page: wait until streaming stops AND a new <img> asset is stable
    └── fetch the asset bytes in-page (credentials:'include') → base64 → save
-       (the signed estuary/content URL is authorized by the browser's own cookies)
+       (the signed estuary/content URL is authorized by the browser's own cookies;
+        the 2026-09 redesign serves a blob: URL instead, which only the page can read)
 ```
 
 No tokens leave the browser. Each run's chat lands inside the `imagegen` Project (auto-created) instead of the top-level history; pass `--project ""` to opt out, and the conversation is deleted afterwards by default (`--keep-conversation` to keep it).

@@ -212,6 +212,45 @@ WEB_PROJECT_URL = "https://chatgpt.com/g/{gizmo_id}/project"
 DEFAULT_PROJECT = "imagegen"
 # Image assets render as <img> whose src points at one of these backend paths.
 WEB_IMG_SRC_RE = r"estuary/content|files/download|oaiusercontent"
+
+# chatgpt.com DOM selectors, shared by the page-side JS and the chrome-use
+# commands. ChatGPT rolls UI redesigns out gradually (issue #41, 2026-09), so
+# each list keeps the older layout's selector FIRST and adds the redesigned
+# one after it — whichever the account is served, one of them matches.
+#   old: #prompt-textarea, button[data-testid=send-button],
+#        [data-message-author-role=user|assistant], estuary/content <img> src
+#   new: a bare div.ProseMirror[contenteditable] in the composer <form>, a
+#        plain (localized) button[type=submit], turns as div[data-turn-key]
+#        holding [data-user-message-bubble] + h4[data-conversation-role=
+#        assistant], and results as blob: <img> in
+#        [data-testid=generated-image-preview]
+WEB_COMPOSER_SEL = '#prompt-textarea, form div.ProseMirror[contenteditable="true"]'
+# Send, looked up INSIDE the composer form. The redesigned button has no testid
+# and a localized label ("Send prompt", "发送", …), so match its type — but
+# never the voice/dictation controls that share the submit-button slot.
+WEB_SEND_SEL = ('button[data-testid="send-button"], button#composer-submit-button, '
+                'button[type="submit"]:not([aria-label*="voice" i])'
+                ':not([aria-label*="dictat" i]):not([aria-label*="语音"])')
+# The Send click target: WEB_SEND_SEL scoped to the form holding the composer,
+# so a submit button in some other form (a dialog, a search box) never matches.
+WEB_SEND_CLICK_SEL = ", ".join(
+    f'form:has(div.ProseMirror[contenteditable="true"]) {s.strip()}'
+    for s in ('button[data-testid="send-button"]', "button#composer-submit-button",
+              'button[type="submit"]:not([aria-label*="voice" i])'
+              ':not([aria-label*="dictat" i]):not([aria-label*="语音"])'))
+# The stop-generating control; the label is localized in the redesign.
+WEB_STOP_SEL = ('button[data-testid="stop-button"], button[aria-label*="Stop" i], '
+                'button[aria-label*="停止"], button[aria-label*="中止"]')
+# A user's message: the old role marker or the redesigned bubble.
+WEB_USER_MSG_SEL = '[data-message-author-role="user"], [data-user-message-bubble]'
+# The redesigned thread's turn container, and the reply content inside one that
+# proves the assistant has actually answered (its h4 role heading renders
+# before the reply does, so the heading alone proves nothing).
+WEB_TURN_SEL = "[data-turn-key]"
+WEB_ASSISTANT_BODY_SEL = '[data-markdown-copy], [data-testid="generated-image-gallery"]'
+# A generated result in the redesigned UI. Its src is a blob: URL (not matched
+# by WEB_IMG_SRC_RE), which only the page itself can fetch.
+WEB_GEN_IMG_SEL = '[data-testid="generated-image-preview"] img'
 # Composer model the web backend forces before generating. The "Pro" reasoning
 # tier has NO built-in image generator — it answers an image request by running
 # Code Interpreter (Python/PIL, a downloadable file) or flat-out refusing ("image
@@ -1379,22 +1418,35 @@ def _ab_eval(ab: str, js: str, session: str, timeout: float) -> Any:
 # so don't be tempted to scope tighter than <main>.
 _JS_STATE = r"""(() => {
   const seen = new Set(%s);
-  const stop = !!document.querySelector(
-    'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
-  );
   const re = new RegExp(%s);
+  const SEL = %s;
+  const stop = !!document.querySelector(SEL.stop);
   // The generated image renders in <main> but OUTSIDE any message bubble (it's
   // an image-generation card, not an assistant text turn — so we can't scope to
   // the assistant role). An img2img reference, however, is echoed INSIDE the
   // user bubble with a fresh estuary/content src not in the pre-submit baseline.
   // So detect fresh main images but exclude any that belong to a user message.
   const userSrcs = new Set();
-  document.querySelectorAll('[data-message-author-role="user"] img')
+  document.querySelectorAll(SEL.user.split(',').map(s => s + ' img').join(','))
     .forEach(i => { const s = i.currentSrc || i.src; if (s) userSrcs.add(s); });
+  // Redesign (#41): the result is a blob: <img> inside the generated-image
+  // preview; count it once it has actually decoded (a blob placeholder that
+  // hasn't loaded yet must not be taken as final).
   const fresh = [...document.querySelectorAll('main img')]
+    .filter(i => re.test(i.currentSrc || i.src) ||
+      (i.matches(SEL.genImg) && i.complete && i.naturalWidth > 0))
     .map(i => i.currentSrc || i.src)
-    .filter(s => re.test(s) && !seen.has(s) && !userSrcs.has(s));
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+    .filter(s => s && !seen.has(s) && !userSrcs.has(s));
+  let a = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  if (!a.length) {
+    // Redesign: each turn container holds the user bubble AND the reply; the
+    // reply exists once it has rendered content (markdown or an image gallery).
+    const turns = [...document.querySelectorAll('main ' + SEL.turn)];
+    const t = turns[turns.length - 1];
+    const body = t && t.querySelector('[data-conversation-role="assistant"]') &&
+      t.querySelector(SEL.body);
+    if (body) a = [body];
+  }
   const lastA = a[a.length - 1];
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
@@ -1406,26 +1458,64 @@ _JS_STATE = r"""(() => {
 
 _JS_BASELINE = r"""(() => {
   const re = new RegExp(%s);
+  const genImg = %s;
   const srcs = [...document.querySelectorAll('main img')]
-    .map(i => i.currentSrc || i.src).filter(s => re.test(s));
+    .filter(i => re.test(i.currentSrc || i.src) || i.matches(genImg))
+    .map(i => i.currentSrc || i.src).filter(Boolean);
   return JSON.stringify(srcs);
 })()"""
+
+
+def _js_state_selectors() -> str:
+    """The selector bundle _JS_STATE reads, as a JS object literal."""
+    return json.dumps({"stop": WEB_STOP_SEL, "user": WEB_USER_MSG_SEL,
+                       "genImg": WEB_GEN_IMG_SEL, "turn": WEB_TURN_SEL,
+                       "body": WEB_ASSISTANT_BODY_SEL}, ensure_ascii=False)
 
 # JS: fetch the asset bytes from inside the authenticated page and hand them
 # back base64-encoded along with the content type. credentials:'include' reuses
 # the browser's session cookies, so the signed/asset URL resolves.
 _JS_FETCH = r"""(async () => {
-  try {
-    const r = await fetch(%s, {credentials: 'include'});
-    if (!r.ok) return JSON.stringify({ok: false, status: r.status});
-    const buf = new Uint8Array(await (await r.blob()).arrayBuffer());
+  const src = %s;
+  const pack = async (blob, type) => {
+    const buf = new Uint8Array(await blob.arrayBuffer());
     let bin = '';
     const CH = 0x8000;
     for (let i = 0; i < buf.length; i += CH)
       bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
-    return JSON.stringify({ok: true, type: r.headers.get('content-type'),
+    return JSON.stringify({ok: true, type: type || blob.type,
                            bytes: buf.length, b64: btoa(bin)});
-  } catch (e) { return JSON.stringify({ok: false, error: String(e)}); }
+  };
+  // Last resort for a blob: src (redesign, #41) that ChatGPT revoked between
+  // detection and download: the decoded <img> is still on the page, so
+  // re-encode its pixels losslessly. Same-origin blob, so the canvas isn't
+  // tainted.
+  const fromImg = async () => {
+    const img = [...document.querySelectorAll('img')]
+      .find(i => (i.currentSrc || i.src) === src && i.complete && i.naturalWidth > 0);
+    if (!img) return null;
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0);
+    const b = await new Promise(res => c.toBlob(res, 'image/png'));
+    return b ? pack(b, 'image/png') : null;
+  };
+  try {
+    // blob: URLs only resolve inside the page that minted them, which is why
+    // the bytes are fetched here and handed back base64 — never from outside.
+    const r = await fetch(src, src.startsWith('blob:') ? {} : {credentials: 'include'});
+    if (!r.ok) {
+      const alt = src.startsWith('blob:') ? await fromImg() : null;
+      return alt || JSON.stringify({ok: false, status: r.status});
+    }
+    return await pack(await r.blob(), r.headers.get('content-type'));
+  } catch (e) {
+    try {
+      const alt = src.startsWith('blob:') ? await fromImg() : null;
+      if (alt) return alt;
+    } catch (e2) {}
+    return JSON.stringify({ok: false, error: String(e)});
+  }
 })()"""
 
 # JS: resolve a ChatGPT Project (a "snorlax" gizmo, id g-p-…) by exact display
@@ -1476,7 +1566,7 @@ _JS_COMPOSER = r"""(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   return JSON.stringify({
-    composer: !!document.querySelector('#prompt-textarea'),
+    composer: !!document.querySelector(%s),
     limited: /too many requests|requests too quickly/i.test(dlg),
   });
 })()"""
@@ -1488,14 +1578,14 @@ _RATE_LIMIT_MSG = (
 
 
 def _wait_composer(ab: str, session: str, remaining, tries: int = 15) -> bool:
-    """Poll until the chat composer (#prompt-textarea) is on the page.
+    """Poll until the chat composer (WEB_COMPOSER_SEL) is on the page.
 
     Raises WebRateLimited if the page shows the "Too many requests" dialog —
     waiting out the poll budget (and then other profile candidates) would just
     burn ~45s each on an account-level block."""
     for _ in range(tries):
         try:
-            st = _ab_eval(ab, _JS_COMPOSER, session=session,
+            st = _ab_eval(ab, _JS_COMPOSER % json.dumps(WEB_COMPOSER_SEL), session=session,
                           timeout=min(20.0, remaining()))
             if isinstance(st, dict):
                 if st.get("limited"):
@@ -2130,7 +2220,8 @@ def _resolve_ref_path(ref: str) -> tuple[str, str | None]:
 # spacing) or textContent (which loses paragraph breaks). A ProseMirror trailing
 # BR is an empty-paragraph placeholder, not an extra newline.
 _JS_WEB_COMPOSER_STATE = r"""(() => {
-  const composer = document.querySelector('#prompt-textarea');
+  const SEL = %s;
+  const composer = document.querySelector(SEL.composer);
   const form = composer && composer.closest('form');
   const read = n => {
     if (n.nodeType === 3) return n.textContent;
@@ -2147,7 +2238,17 @@ _JS_WEB_COMPOSER_STATE = r"""(() => {
   }
   const images = form ? [...form.querySelectorAll('img')]
     .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || '')) : [];
-  const send = form && form.querySelector('button[data-testid="send-button"]');
+  const send = form && form.querySelector(SEL.send);
+  // A user message per turn. The redesign renders the whole thread twice, so
+  // key each message by its turn container and count distinct turns; a marker
+  // nested inside another marker (old role div around a bubble) is the same
+  // message, not a second one.
+  const turns = new Set();
+  document.querySelectorAll(SEL.user).forEach(m => {
+    if (m.parentElement && m.parentElement.closest(SEL.user)) return;
+    const t = m.closest(SEL.turn);
+    turns.add(t ? 'k:' + t.getAttribute('data-turn-key') : m);
+  });
   return JSON.stringify({
     exists: !!composer, text,
     attachments: images.length,
@@ -2156,14 +2257,21 @@ _JS_WEB_COMPOSER_STATE = r"""(() => {
     ready: images.filter(i => !i.src.startsWith('blob:')).length,
     busy: !!(form && form.querySelector('[role="progressbar"], [aria-busy="true"]')),
     send_ready: !!send && !send.disabled && send.getAttribute('aria-disabled') !== 'true',
-    user_turns: document.querySelectorAll('[data-message-author-role="user"]').length,
+    user_turns: turns.size,
   });
 })()"""
 
 
+def _js_composer_selectors() -> str:
+    """The selector bundle _JS_WEB_COMPOSER_STATE reads, as a JS object literal."""
+    return json.dumps({"composer": WEB_COMPOSER_SEL, "send": WEB_SEND_SEL,
+                       "user": WEB_USER_MSG_SEL, "turn": WEB_TURN_SEL},
+                      ensure_ascii=False)
+
+
 def _web_composer_state(ab, session, remaining) -> dict:
     """Read logical editor text and upload/send state, requiring a live composer."""
-    state = _ab_eval(ab, _JS_WEB_COMPOSER_STATE, session=session,
+    state = _ab_eval(ab, _JS_WEB_COMPOSER_STATE % _js_composer_selectors(), session=session,
                      timeout=min(15.0, remaining()))
     if not isinstance(state, dict) or not state.get("exists"):
         raise GatewayError("ChatGPT composer is unavailable; submission cannot be verified")
@@ -2253,7 +2361,7 @@ _DRAFT_HINT = ("Clear the ChatGPT composer at https://chatgpt.com/ (a leftover d
 def _clear_web_composer(ab, session, remaining) -> None:
     """Best-effort: empty the composer so our own text is not left as a draft."""
     try:
-        _ab(ab, "fill", "#prompt-textarea", "--stdin", input_text="",
+        _ab(ab, "fill", WEB_COMPOSER_SEL, "--stdin", input_text="",
             session=session, timeout=min(20.0, remaining()))
     except GatewayError:
         pass
@@ -2275,7 +2383,7 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
     if initial.get("text"):
         raise GatewayError("ChatGPT composer is not empty; prompt not submitted. " + _DRAFT_HINT)
     emit("pasting prompt")
-    _ab(ab, "fill", "#prompt-textarea", "--stdin", input_text=user_text,
+    _ab(ab, "fill", WEB_COMPOSER_SEL, "--stdin", input_text=user_text,
         session=session, timeout=min(60.0, remaining()))
     # Everything below until the click is a "nothing was sent" failure. ChatGPT
     # keeps composer drafts across chats, so leaving our text in the box would
@@ -2309,7 +2417,7 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
     emit(f"verified prompt ({len(user_text)} characters) and {n_refs} reference image(s)")
     send_error = None
     try:
-        _ab(ab, "click", 'button[data-testid="send-button"]',
+        _ab(ab, "click", WEB_SEND_CLICK_SEL,
             session=session, timeout=min(20.0, remaining()))
     except GatewayError as error:
         send_error = error
@@ -2360,7 +2468,8 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
     # Capture the baseline set of image srcs already on the page so we never
     # mistake a prior image — INCLUDING a just-uploaded reference, whose src is
     # also an estuary/content URL — for the new one.
-    baseline = _ab_eval(ab, _JS_BASELINE % json.dumps(WEB_IMG_SRC_RE),
+    baseline = _ab_eval(ab, _JS_BASELINE % (json.dumps(WEB_IMG_SRC_RE),
+                                            json.dumps(WEB_GEN_IMG_SEL)),
                         session=session, timeout=min(20.0, remaining()))
     if not isinstance(baseline, list):
         baseline = []
@@ -2369,7 +2478,8 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
 
     # Poll until the stream stops AND a brand-new image asset is present and
     # stable across two reads (guards against grabbing a mid-render partial).
-    state_js = _JS_STATE % (json.dumps(baseline), json.dumps(WEB_IMG_SRC_RE))
+    state_js = _JS_STATE % (json.dumps(baseline), json.dumps(WEB_IMG_SRC_RE),
+                            _js_state_selectors())
     last_phase = ""
     final_src: str | None = None
     stable_src: str | None = None

@@ -10,6 +10,8 @@ Run:  python3 -m unittest test_image_use -v
 """
 
 import argparse
+import base64
+import html.parser
 import importlib.machinery
 import importlib.util
 import inspect
@@ -2512,9 +2514,9 @@ class WebPromptSubmission(unittest.TestCase):
                    _composer_state(prompt, attachments=5),
                    _composer_state(user_turns=1)], prompt)
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.calls[0][0], ("ab", "fill", "#prompt-textarea", "--stdin"))
+        self.assertEqual(self.calls[0][0], ("ab", "fill", cig.WEB_COMPOSER_SEL, "--stdin"))
         self.assertEqual(self.calls[0][1]["input_text"], prompt)
-        self.assertEqual(self.calls[1][0][1:], ("click", 'button[data-testid="send-button"]'))
+        self.assertEqual(self.calls[1][0][1:], ("click", cig.WEB_SEND_CLICK_SEL))
 
     def test_changed_text_attachments_or_early_submission_prevents_send(self):
         """Stop before Send if prompt text, reference state, or user turns change."""
@@ -3476,6 +3478,319 @@ class SkillManifestTests(unittest.TestCase):
     def test_version_matches_cli(self):
         m = re.search(r'^version: "([^"]+)"', self._frontmatter(), re.M)
         self.assertEqual(m.group(1), cig.__version__)
+
+
+# ---------- chatgpt.com DOM fixtures (issue #41) ----------
+#
+# The web backend's page-side JS is only as good as its selectors, and ChatGPT
+# rolls redesigns out per account. These tests hold the selector constants to
+# DOM snapshots of BOTH layouts in tests/fixtures/, using a tiny stdlib CSS
+# matcher (descendant combinator, tag/#id/.class, [attr], = *= ^= with the `i`
+# flag, :not() and :has()) — enough for the selectors the CLI uses, no deps.
+
+_FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
+_VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+         "meta", "source", "track", "wbr"}
+
+
+class _Node:
+    def __init__(self, tag, attrs, parent):
+        self.tag, self.attrs, self.parent, self.children = tag, attrs, parent, []
+
+    def iter(self):
+        for c in self.children:
+            yield c
+            yield from c.iter()
+
+    def closest(self, sel):
+        n = self
+        while n is not None and n.tag != "#root":
+            if _matches(n, sel):
+                return n
+            n = n.parent
+        return None
+
+
+class _TreeBuilder(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _Node("#root", {}, None)
+        self.cur = self.root
+
+    def handle_starttag(self, tag, attrs):
+        node = _Node(tag, {k: (v if v is not None else "") for k, v in attrs}, self.cur)
+        self.cur.children.append(node)
+        if tag not in _VOID:
+            self.cur = node
+
+    def handle_endtag(self, tag):
+        n = self.cur
+        while n is not None and n.tag != tag:
+            n = n.parent
+        if n is not None and n.parent is not None:
+            self.cur = n.parent
+
+
+def _parse(markup):
+    b = _TreeBuilder()
+    b.feed(markup)
+    return b.root
+
+
+def _split_top(s, sep):
+    """Split on `sep` outside (), [] and quotes."""
+    out, depth, quote, buf = [], 0, None, ""
+    for ch in s:
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and (ch == sep or (sep == " " and ch.isspace())):
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+            continue
+        buf += ch
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+_ATTR_RE = re.compile(r'\[\s*([\w-]+)\s*(?:([*^]?=)\s*(?:"([^"]*)"|\'([^\']*)\'|([^\]\s]+))\s*(i)?\s*)?\]')
+
+
+def _match_compound(node, comp):
+    if node.tag == "#root":
+        return False
+    i = 0
+    m = re.match(r"[a-zA-Z][\w-]*", comp)
+    if m:
+        if node.tag != m.group(0).lower():
+            return False
+        i = m.end()
+    while i < len(comp):
+        ch = comp[i]
+        if ch in "#.":
+            m = re.match(r"[\w-]+", comp[i + 1:])
+            name = m.group(0)
+            if ch == "#" and node.attrs.get("id") != name:
+                return False
+            if ch == "." and name not in node.attrs.get("class", "").split():
+                return False
+            i += 1 + m.end()
+        elif ch == "[":
+            m = _ATTR_RE.match(comp, i)
+            name, op = m.group(1), m.group(2)
+            val = next((g for g in m.group(3, 4, 5) if g is not None), None)
+            have = node.attrs.get(name)
+            if have is None:
+                return False
+            if op:
+                a, b = (have.lower(), val.lower()) if m.group(6) else (have, val)
+                if (op == "=" and a != b) or (op == "*=" and b not in a) \
+                        or (op == "^=" and not a.startswith(b)):
+                    return False
+            i = m.end()
+        elif comp.startswith(":not(", i) or comp.startswith(":has(", i):
+            depth, j = 0, i + 4
+            while True:
+                depth += comp[j] == "("
+                depth -= comp[j] == ")"
+                if depth == 0:
+                    break
+                j += 1
+            inner = comp[i + 5:j]
+            if comp.startswith(":not(", i) and _matches(node, inner):
+                return False
+            if comp.startswith(":has(", i) and not any(_matches(d, inner) for d in node.iter()):
+                return False
+            i = j + 1
+        else:
+            raise ValueError(f"unsupported selector syntax at {comp[i:]!r}")
+    return True
+
+
+def _match_complex(node, parts):
+    if not _match_compound(node, parts[-1]):
+        return False
+    rest, anc = parts[:-1], node.parent
+    while rest and anc is not None:
+        if _match_compound(anc, rest[-1]) and _match_complex(anc, rest):
+            return True
+        anc = anc.parent
+    return not rest
+
+
+def _matches(node, selector):
+    return any(_match_complex(node, _split_top(c, " ")) for c in _split_top(selector, ","))
+
+
+def _select(root, selector):
+    return [n for n in root.iter() if _matches(n, selector)]
+
+
+def _fixture(name):
+    return _parse((_FIXTURES / name).read_text(encoding="utf-8"))
+
+
+class SelectorEngineSelfTest(unittest.TestCase):
+    """The mini matcher must agree with CSS on the constructs the CLI uses."""
+
+    def test_constructs(self):
+        root = _parse('<form><div class="ProseMirror x" contenteditable="true"></div>'
+                      '<button type="submit" aria-label="Start VOICE"></button>'
+                      '<button type="submit" aria-label="Send"></button></form>'
+                      '<form><button type="submit" aria-label="Go"></button></form>')
+        self.assertEqual(len(_select(root, 'form div.ProseMirror[contenteditable="true"]')), 1)
+        self.assertEqual(len(_select(root, 'button[aria-label*="voice" i]')), 1)
+        self.assertEqual(len(_select(root, 'button[aria-label*="voice"]')), 0)
+        self.assertEqual(
+            [n.attrs["aria-label"] for n in _select(
+                root, 'form:has(div.ProseMirror) button[type="submit"]:not([aria-label*="voice" i])')],
+            ["Send"])
+
+
+class ChatGPTDomSelectors(unittest.TestCase):
+    """Hold the web backend's selectors to both chatgpt.com layouts (issue #41)."""
+
+    LAYOUTS = ("chatgpt-thread-legacy.html", "chatgpt-thread-redesign.html")
+
+    def _user_turns(self, root):
+        """Mirror of the distinct-turn count in _JS_WEB_COMPOSER_STATE."""
+        seen = set()
+        for m in _select(root, cig.WEB_USER_MSG_SEL):
+            if m.parent is not None and m.parent.closest(cig.WEB_USER_MSG_SEL):
+                continue
+            t = m.closest(cig.WEB_TURN_SEL)
+            seen.add(("k", t.attrs["data-turn-key"]) if t else id(m))
+        return len(seen)
+
+    def test_composer_and_send_resolve_in_both_layouts(self):
+        for name in self.LAYOUTS:
+            with self.subTest(layout=name):
+                root = _fixture(name)
+                composers = _select(root, cig.WEB_COMPOSER_SEL)
+                self.assertEqual(len(composers), 1)
+                form = composers[0].closest("form")
+                self.assertIsNotNone(form)
+                sends = _select(form, cig.WEB_SEND_SEL)
+                self.assertEqual(len(sends), 1)
+                self.assertEqual(sends[0].attrs.get("type"), "submit")
+                # The page-wide click selector hits that same button, only it.
+                self.assertEqual(_select(root, cig.WEB_SEND_CLICK_SEL), sends)
+
+    def test_redesign_has_none_of_the_legacy_markers(self):
+        """The reason #41 broke: every legacy hook is gone from the redesign."""
+        root = _fixture("chatgpt-thread-redesign.html")
+        for sel in ("#prompt-textarea", 'button[data-testid="send-button"]',
+                    "[data-message-author-role]"):
+            self.assertEqual(_select(root, sel), [], sel)
+
+    def test_one_user_turn_even_though_the_redesign_renders_the_thread_twice(self):
+        for name in self.LAYOUTS:
+            with self.subTest(layout=name):
+                self.assertEqual(self._user_turns(_fixture(name)), 1)
+        root = _fixture("chatgpt-thread-redesign.html")
+        self.assertEqual(len(_select(root, "[data-user-message-bubble]")), 2)
+
+    def test_nested_user_markers_count_once(self):
+        root = _parse('<div data-message-author-role="user">'
+                      '<div data-user-message-bubble="true">hi</div></div>')
+        self.assertEqual(self._user_turns(root), 1)
+
+    def test_generated_image_is_found_and_user_images_are_not(self):
+        re_src = re.compile(cig.WEB_IMG_SRC_RE)
+        for name in self.LAYOUTS:
+            with self.subTest(layout=name):
+                root = _fixture(name)
+                user = {i.attrs["src"] for i in _select(
+                    root, ", ".join(s.strip() + " img" for s in cig.WEB_USER_MSG_SEL.split(",")))}
+                fresh = [i.attrs["src"] for i in _select(root, "main img")
+                         if (re_src.search(i.attrs.get("src", "")) or _matches(i, cig.WEB_GEN_IMG_SEL))
+                         and i.attrs["src"] not in user]
+                self.assertTrue(fresh)
+                if name.endswith("redesign.html"):
+                    # blob: src — the regex alone would never have matched it.
+                    self.assertTrue(all(s.startswith("blob:https://chatgpt.com/") for s in fresh))
+                    self.assertFalse(any(re_src.search(s) for s in fresh))
+                else:
+                    self.assertTrue(all("file_00000000000000000000000000000002" in s for s in fresh))
+
+    def test_redesign_reply_detected_only_once_it_has_content(self):
+        root = _fixture("chatgpt-thread-redesign.html")
+        turn = _select(root, "main " + cig.WEB_TURN_SEL)[-1]
+        self.assertTrue(_select(turn, '[data-conversation-role="assistant"]'))
+        self.assertTrue(_select(turn, cig.WEB_ASSISTANT_BODY_SEL))
+        pending = _parse('<main><div data-turn-key="t"><div data-user-message-bubble="true">x</div>'
+                         '<h4 data-conversation-role="assistant">ChatGPT</h4></div></main>')
+        self.assertEqual(_select(pending, cig.WEB_ASSISTANT_BODY_SEL), [])
+
+    def test_send_never_matches_voice_or_dictation(self):
+        root = _parse('<form><div class="ProseMirror" contenteditable="true"></div>'
+                      '<button type="submit" aria-label="Start Voice"></button>'
+                      '<button type="submit" aria-label="开始语音"></button>'
+                      '<button type="submit" aria-label="Start dictation"></button></form>')
+        self.assertEqual(_select(root, cig.WEB_SEND_SEL), [])
+        self.assertEqual(_select(root, cig.WEB_SEND_CLICK_SEL), [])
+
+    def test_stop_button_matches_localized_labels(self):
+        for label in ("Stop streaming", "停止生成", "中止"):
+            root = _parse(f'<button aria-label="{label}"></button>')
+            self.assertEqual(len(_select(root, cig.WEB_STOP_SEL)), 1, label)
+
+    def test_page_js_templates_are_fully_formatted(self):
+        """Every selector bundle lands in the JS; no stray %s is left behind."""
+        filled = [
+            cig._JS_STATE % (json.dumps([]), json.dumps(cig.WEB_IMG_SRC_RE),
+                             cig._js_state_selectors()),
+            cig._JS_BASELINE % (json.dumps(cig.WEB_IMG_SRC_RE), json.dumps(cig.WEB_GEN_IMG_SEL)),
+            cig._JS_WEB_COMPOSER_STATE % cig._js_composer_selectors(),
+            cig._JS_COMPOSER % json.dumps(cig.WEB_COMPOSER_SEL),
+            cig._JS_FETCH % json.dumps("blob:https://chatgpt.com/x"),
+        ]
+        for js in filled:
+            self.assertNotIn("%s", js)
+        self.assertIn(json.dumps(cig.WEB_GEN_IMG_SEL), filled[0])
+        self.assertIn(json.dumps(cig.WEB_SEND_SEL, ensure_ascii=False), filled[2])
+
+    def test_blob_src_is_fetched_in_page_with_a_decoded_img_fallback(self):
+        """A blob: URL only resolves inside the page, so the download runs there
+        and can fall back to re-encoding the already-decoded <img>."""
+        js = cig._JS_FETCH % json.dumps("blob:https://chatgpt.com/x")
+        self.assertIn("startsWith('blob:')", js)
+        self.assertIn("toBlob", js)
+        self.assertIn("credentials: 'include'", js)
+
+
+class WebGenerateBlobDownload(unittest.TestCase):
+    """End-to-end over simulated Chrome: a blob: result is detected and saved."""
+
+    def test_blob_result_is_downloaded_through_the_page(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        blob = "blob:https://chatgpt.com/00000000-0000-0000-0000-000000000001"
+        evals = []
+
+        def fake_eval(ab, js, session, timeout):
+            evals.append(js)
+            if js.startswith(cig._JS_BASELINE[:40]):
+                return []
+            if "credentials" in js and "fetch(src" in js:
+                return {"ok": True, "type": "image/png", "b64": base64.b64encode(png).decode()}
+            return {"stop": False, "last": blob, "assistant": True, "limited": False, "atext": ""}
+
+        args = argparse.Namespace(timeout=60)
+        with unittest.mock.patch.object(cig, "_ab_eval", side_effect=fake_eval), \
+             unittest.mock.patch.object(cig, "_submit_web_prompt"), \
+             unittest.mock.patch.object(cig.time, "sleep"):
+            data, meta = cig._generate_in_browser(
+                "ab", "s", "prompt", args, time.monotonic() + 60, lambda: 60, lambda _: None)
+        self.assertEqual(data, png)
+        self.assertEqual(meta["content_type"], "image/png")
+        self.assertIn(json.dumps(blob), evals[-1])
 
 
 if __name__ == "__main__":
