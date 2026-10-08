@@ -963,6 +963,8 @@ def _post_for_image(
     start: float,
     stall_timeout: float,
     progress: bool,
+    endpoint: str = CODEX_BACKEND,
+    redact_token: str | None = None,
 ) -> tuple[bytes, JsonDict]:
     """Returns (image_bytes, item_meta). Raises GatewayError on failure.
 
@@ -980,11 +982,13 @@ def _post_for_image(
     failure_detail: str | None = None
 
     def emit(msg: str) -> None:
+        if redact_token:
+            msg = msg.replace(redact_token, "[redacted]")
         if progress:
             print(_fmt_progress(time.monotonic() - start, msg), file=sys.stderr)
 
     try:
-        for evt in _stream(CODEX_BACKEND, headers, payload, deadline, stall_timeout):
+        for evt in _stream(endpoint, headers, payload, deadline, stall_timeout):
             t = evt.get("type", "?")
             saw_event_types[t] = saw_event_types.get(t, 0) + 1
             first = saw_event_types[t] == 1
@@ -1037,6 +1041,8 @@ def _post_for_image(
                             last_revised_prompt = item["revised_prompt"]
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="ignore")
+        if redact_token:
+            body_text = body_text.replace(redact_token, "[redacted]")
         raise GatewayError(f"HTTP {e.code}: {body_text[:600]}", status=e.code) from None
     except (TimeoutError, ConnectionError):
         # Socket read timed out or the connection dropped mid-stream. Surface a
@@ -1069,6 +1075,8 @@ def _post_for_image(
         raise GatewayError(f"no image returned. events seen: {types_seen}")
 
     if last_revised_prompt:
+        if redact_token:
+            last_revised_prompt = last_revised_prompt.replace(redact_token, "[redacted]")
         emit(f"revised prompt: {last_revised_prompt[:120]}")
 
     try:
@@ -1181,8 +1189,77 @@ def _warn_if_chrome_use_old(ab: str, emit) -> None:
         )
 
 
-def _codex_token_present() -> bool:
-    """True if ~/.codex/auth.json carries a usable ChatGPT OAuth access_token."""
+def _codex_provider(name: str | None = None) -> JsonDict | None:
+    """Resolve opt-in Responses providers without touching ChatGPT credentials."""
+    name = _env("IMAGE_USE_CODEX_PROVIDER", "") if name is None else name
+    if not name:
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        raise GatewayError("Codex provider mode requires Python 3.11+") from None
+    path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    try:
+        with path.open("rb") as f:
+            config = tomllib.load(f)
+    except (OSError, ValueError):
+        raise GatewayError(f"cannot read or parse {path}") from None
+    if name == "current":
+        name = config.get("model_provider")
+        if not isinstance(name, str) or not name:
+            raise GatewayError("config.toml has no model_provider")
+    provider = config.get("model_providers", {})
+    provider = provider.get(name) if isinstance(provider, dict) else None
+    if not isinstance(provider, dict):
+        raise GatewayError(f"Codex provider {name!r} not found in {path}")
+    token = provider.get("experimental_bearer_token")
+    env_key = provider.get("env_key")
+    if env_key is not None:
+        if not isinstance(env_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
+            raise GatewayError("invalid provider env_key")
+        token = os.environ.get(env_key)
+        if not token:
+            raise GatewayError(f"provider token environment variable ${env_key} is missing or empty")
+    if not isinstance(token, str) or not token.strip():
+        raise GatewayError("provider requires env_key or experimental_bearer_token")
+    def safe(text):
+        return str(text).replace(token, "[redacted]")
+    base = provider.get("base_url")
+    if not isinstance(base, str) or not base:
+        raise GatewayError("provider base_url is required")
+    try:
+        url = urllib.parse.urlsplit(base)
+        valid = url.scheme in ("http", "https") and url.hostname and not url.username and not url.password and not url.query and not url.fragment
+    except ValueError:
+        valid = False
+    if not valid:
+        raise GatewayError("provider base_url must be an HTTP(S) URL without credentials, query or fragment")
+    if provider.get("wire_api", "responses") != "responses":
+        raise GatewayError("provider wire_api must be responses")
+    headers = {}
+    for field in ("http_headers", "env_http_headers"):
+        table = provider.get(field, {})
+        if not isinstance(table, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in table.items()):
+            raise GatewayError("provider header tables must contain strings")
+        for key, value in table.items():
+            if field == "env_http_headers":
+                value = os.environ.get(value)
+            if value is not None:
+                headers[key] = value
+    # A relay must never inherit an account identifier, even from custom headers.
+    headers = {k: v for k, v in headers.items() if k.lower() not in ("chatgpt-account-id", "authorization")}
+    source = f"token from ${env_key}: present" if env_key else "token in config.toml"
+    return dict(token=token, headers=headers, endpoint=base.rstrip("/") + "/responses",
+                model=config.get("model"), detail=safe(f"relay provider '{name}' ({url.hostname}), {source}"))
+
+
+def _codex_token_present(provider_name: str | None = None) -> bool:
+    """True if the selected provider or ChatGPT OAuth credentials are ready."""
+    if provider_name or (provider_name is None and _env("IMAGE_USE_CODEX_PROVIDER")):
+        try:
+            return _codex_provider(provider_name) is not None
+        except GatewayError:
+            return False
     try:
         auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -3964,15 +4041,22 @@ def run_codex(
     big agent batch can't trip the per-account limiter. Tune (or disable with
     0) via IMAGE_USE_CODEX_CONCURRENCY.
     """
-    auth = _load_auth()
-    access, account_id, refresh = _extract_access_token(auth)
-    if not access:
-        sys.exit(
-            "no ChatGPT OAuth access_token in ~/.codex/auth.json. "
-            "Run `codex login` to sign into your ChatGPT subscription. "
-            "(An OPENAI_API_KEY in this file is not a substitute — the backend "
-            "requires a subscription OAuth token.)"
-        )
+    try:
+        provider = _codex_provider(getattr(args, "codex_provider", None))
+    except GatewayError as e:
+        sys.exit(f"codex provider: {e}")
+    if provider:
+        access, account_id, refresh, auth = provider["token"], None, None, {}
+    else:
+        auth = _load_auth()
+        access, account_id, refresh = _extract_access_token(auth)
+        if not access:
+            sys.exit(
+                "no ChatGPT OAuth access_token in ~/.codex/auth.json. "
+                "Run `codex login` to sign into your ChatGPT subscription. "
+                "(An OPENAI_API_KEY in this file is not a substitute — the backend "
+                "requires a subscription OAuth token.)"
+            )
 
     loaded_refs: list[tuple[str, str]] | None = None
     if refs:
@@ -3988,7 +4072,8 @@ def run_codex(
     version = _detect_codex_version()
     n_char, n_style, n_comp = _ref_counts(args, refs)
     payload = _build_payload(
-        args.gen_prompt, args.size, args.format, args.model,
+        args.gen_prompt, args.size, args.format,
+        args.model or (provider and provider["model"]) or CODEX_MODEL_DEFAULT,
         refs=loaded_refs,
         n_character_refs=n_char, n_style_refs=n_style,
         n_composition_refs=n_comp,
@@ -4003,12 +4088,12 @@ def run_codex(
                            progress, start):
         return _run_codex_locked(
             args, progress, stall_timeout, start, payload, account_id, access,
-            refresh, version, auth)
+            refresh, version, auth, provider)
 
 
 def _run_codex_locked(
     args, progress, stall_timeout, start, payload, account_id, access,
-    refresh, version, auth,
+    refresh, version, auth, provider=None,
 ) -> tuple[bytes, JsonDict]:
     # Budget from NOW, not process start: the run may have queued on the codex
     # concurrency slot, and that wait must not eat the --timeout image budget.
@@ -4016,6 +4101,24 @@ def _run_codex_locked(
 
     def _attempt(token: str) -> tuple[bytes, JsonDict]:
         headers = _build_headers(token, account_id, version)
+        if provider:
+            headers.update(provider["headers"])
+            try:
+                data, meta = _post_for_image(payload, headers, deadline, start, stall_timeout,
+                                             progress, provider["endpoint"], token)
+                # Response metadata is later logged and may echo request secrets.
+                def redact(value):
+                    if isinstance(value, str):
+                        return value.replace(token, "[redacted]")
+                    if isinstance(value, list):
+                        return [redact(v) for v in value]
+                    if isinstance(value, dict):
+                        return {redact(k): redact(v) for k, v in value.items()}
+                    return value
+                return data, redact(meta)
+            except Exception as error:
+                message = str(error).replace(token, "[redacted]")
+                raise GatewayError(message, status=getattr(error, "status", None)) from None
         return _post_for_image(payload, headers, deadline, start, stall_timeout, progress)
 
     try:
@@ -4027,8 +4130,11 @@ def _run_codex_locked(
         if (_model_unsupported_error(e)
                 and payload.get("model") != CODEX_MODEL_FALLBACK):
             if progress:
+                shown_model = repr(payload.get("model"))
+                if provider:
+                    shown_model = shown_model.replace(access, "[redacted]")
                 print(f"[{time.monotonic() - start:6.1f}s] model "
-                      f"{payload.get('model')!r} not supported by this Codex "
+                      f"{shown_model} not supported by this Codex "
                       f"account; retrying with {CODEX_MODEL_FALLBACK}",
                       file=sys.stderr)
             payload["model"] = CODEX_MODEL_FALLBACK
@@ -4180,7 +4286,7 @@ def _dispatch(
         if getattr(args, "require_project", False):
             sys.exit(f"required Project needs the web backend: {e}\n"
                      "Codex fallback is disabled by --require-project.")
-        if _codex_token_present():
+        if _codex_token_present(getattr(args, "codex_provider", None)):
             if _find_agent_browser() is None:
                 # chrome-use isn't installed. Keep this to a *gentle* one-line
                 # tip — never dump install commands here, and never install on
@@ -5853,10 +5959,22 @@ def _doctor_command(argv: list[str]) -> int:
     else:
         line("ok", "version", __version__ + (" (latest)" if latest else ""))
 
-    codex_ready = _codex_token_present()
-    line("ok" if codex_ready else "fail", "codex",
-         "OAuth token present (~/.codex/auth.json)" if codex_ready
-         else "no token — run `codex login`")
+    parser = argparse.ArgumentParser(prog="image-use doctor")
+    parser.add_argument("--codex-provider", default=_env("IMAGE_USE_CODEX_PROVIDER"))
+    provider_name = parser.parse_known_args(argv)[0].codex_provider
+    if provider_name:
+        try:
+            provider = _codex_provider(provider_name)
+            codex_ready = True
+            line("ok", "codex", provider["detail"])
+        except GatewayError as error:
+            codex_ready = False
+            line("fail", "codex", str(error))
+    else:
+        codex_ready = _codex_token_present(provider_name)
+        line("ok" if codex_ready else "fail", "codex",
+             "OAuth token present (~/.codex/auth.json)" if codex_ready
+             else "no token — run `codex login`")
 
     print("\n  animation:")
     magick = shutil.which("magick")
@@ -6512,7 +6630,9 @@ def main() -> int:
         parser.set_defaults(format="png")
     else:
         parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"])
-    parser.add_argument("--model", default=_env("IMAGE_USE_MODEL", CODEX_MODEL_DEFAULT),
+    parser.add_argument("--codex-provider", default=_env("IMAGE_USE_CODEX_PROVIDER"),
+                        help="Codex config.toml provider name, or current (Python 3.11+)")
+    parser.add_argument("--model", default=_env("IMAGE_USE_MODEL"),
                         help="(codex backend) the DRIVER model that calls the "
                              "image tool — NOT the image model (the server "
                              "renders with its own, e.g. gpt-image-2-codex). "

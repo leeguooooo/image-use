@@ -362,3 +362,32 @@ This tool is used mostly *through other people's agents*, so **maintainers rarel
 ## Related
 
 - HTTP gateway sibling (for multi-app / SDK-compatible usage): https://github.com/leeguooooo/agent-cli-to-api
+
+### Custom Codex Responses providers
+
+Use `--backend codex --codex-provider current` (or set
+`IMAGE_USE_CODEX_PROVIDER=current`) to select the top-level `model_provider`
+from `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`). A provider name
+such as `--codex-provider myrelay` selects `[model_providers.myrelay]` directly.
+Provider mode requires Python 3.11+; leaving the option/environment variable
+empty preserves the existing ChatGPT OAuth backend on Python 3.10+.
+
+```toml
+model = "gpt-6-astra"
+model_provider = "myrelay"
+[model_providers.myrelay]
+base_url = "https://relay.example"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "MYRELAY_API_KEY"
+```
+
+Supply `MYRELAY_API_KEY` securely in the process environment; prefer `env_key`
+over a plaintext `experimental_bearer_token` in config. The endpoint is
+`base_url.rstrip("/") + "/responses"`; the relay must support the Responses
+`image_generation` tool. Provider mode uses no ChatGPT OAuth or account ID.
+The top-level `model` supplies the driver default; `--model` (or
+`IMAGE_USE_MODEL`) overrides it. Static `http_headers` and `env_http_headers`
+(header name → environment variable name) are supported; unset header
+variables are skipped. `image-use doctor --codex-provider current` checks
+configuration/token readiness without displaying the token.
