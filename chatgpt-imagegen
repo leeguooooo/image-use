@@ -25,7 +25,7 @@ import urllib.request
 # last pre-rename release (0.27.0); after that update the install runs
 # image-use, which checks its own file. No need to bump it per release.
 __version__ = "0.28.0"
-# WHATSNEW[0.28.0]: 改名 image-use(现有 ChatGPT 网页 / Codex / 两个 Gemini 后端,不再只是 ChatGPT);`chatgpt-imagegen` 命令保留为兼容别名,CHATGPT_IMAGEGEN_* 环境变量继续有效(新名 IMAGE_USE_* 优先),风格库与配置目录不变
+# WHATSNEW[0.28.0]: renamed to image-use (it now drives ChatGPT web, Codex and two Gemini backends, not only ChatGPT); the `chatgpt-imagegen` command stays as a compatibility alias, CHATGPT_IMAGEGEN_* env vars still work (the new IMAGE_USE_* take precedence), style library and config directory unchanged
 
 CLI_NAME = "image-use"
 CLI_URL = "https://raw.githubusercontent.com/leeguooooo/image-use/main/image-use"
