@@ -1203,7 +1203,7 @@ def _codex_provider(name: str | None = None) -> JsonDict | None:
         with path.open("rb") as f:
             config = tomllib.load(f)
     except (OSError, ValueError):
-        raise GatewayError("cannot read or parse Codex config.toml") from None
+        raise GatewayError(f"cannot read or parse {path}") from None
     if name == "current":
         name = config.get("model_provider")
         if not isinstance(name, str) or not name:
@@ -1211,7 +1211,7 @@ def _codex_provider(name: str | None = None) -> JsonDict | None:
     provider = config.get("model_providers", {})
     provider = provider.get(name) if isinstance(provider, dict) else None
     if not isinstance(provider, dict):
-        raise GatewayError("Codex provider not found in config.toml")
+        raise GatewayError(f"Codex provider {name!r} not found in {path}")
     token = provider.get("experimental_bearer_token")
     env_key = provider.get("env_key")
     if env_key is not None:
@@ -4041,7 +4041,10 @@ def run_codex(
     big agent batch can't trip the per-account limiter. Tune (or disable with
     0) via IMAGE_USE_CODEX_CONCURRENCY.
     """
-    provider = _codex_provider(getattr(args, "codex_provider", None))
+    try:
+        provider = _codex_provider(getattr(args, "codex_provider", None))
+    except GatewayError as e:
+        sys.exit(f"codex provider: {e}")
     if provider:
         access, account_id, refresh, auth = provider["token"], None, None, {}
     else:

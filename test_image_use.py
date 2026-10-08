@@ -4971,6 +4971,14 @@ class CodexRelayProvider(unittest.TestCase):
         self.assertIn('codex_cli_rs', headers['User-Agent'])
         self.assertEqual(headers['originator'], 'codex_cli_rs')
 
+    def test_misconfigured_provider_exits_cleanly(self):
+        args = argparse.Namespace(gen_prompt='cat', size='auto', format='png',
+                                  model=None, timeout=60, codex_provider='missing')
+        with unittest.mock.patch.object(cig, '_load_auth', side_effect=AssertionError('OAuth read')), \
+             self.assertRaises(SystemExit) as caught:
+            cig.run_codex(args, False, 60, time.monotonic())
+        self.assertIn("'missing' not found", str(caught.exception.code))
+
     def test_config_token(self):
         self.config(credential='experimental_bearer_token = "config-secret"')
         self.assertEqual(self.run_image()[1]['Authorization'], 'Bearer config-secret')
