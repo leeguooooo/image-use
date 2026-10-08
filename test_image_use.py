@@ -4920,5 +4920,189 @@ class RequiredProjectDispatch(unittest.TestCase):
         calls["run_codex"].assert_called_once()
 
 
+
+@unittest.skipIf(sys.version_info < (3, 11), "provider TOML requires Python 3.11+")
+class CodexRelayProvider(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = unittest.mock.patch.dict(os.environ, {
+            "CODEX_HOME": self.tmp.name, "IMAGE_USE_CODEX_PROVIDER": "current",
+            "RELAY_TEST_TOKEN": "secret-relay-test-value", "EXTRA_HEADER": "extra",
+            "IMAGE_USE_CODEX_CONCURRENCY": "0"}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.config()
+
+    def config(self, extra='', base='https://relay.example/', credential='env_key = "RELAY_TEST_TOKEN"'):
+        Path(self.tmp.name, 'config.toml').write_text(
+            'model = "configured-driver"\nmodel_provider = "myrelay"\n'
+            '[model_providers.myrelay]\n' + credential + '\n' +
+            (f'base_url = "{base}"\n' if base is not None else '') + extra)
+
+    def run_image(self, model=None):
+        args = argparse.Namespace(gen_prompt='cat', size='auto', format='png',
+                                  model=model, timeout=60)
+        events = [{'type': 'response.output_item.done', 'item': {
+            'type': 'image_generation_call', 'result': base64.b64encode(b'image').decode()}}]
+        with unittest.mock.patch.object(cig, '_stream', return_value=iter(events)) as stream, \
+             unittest.mock.patch.object(cig, '_detect_codex_version', return_value='1.0'), \
+             unittest.mock.patch.object(cig, '_load_auth', side_effect=AssertionError('OAuth read')), \
+             unittest.mock.patch.object(cig, '_refresh_access_token', side_effect=AssertionError('refresh')):
+            self.assertEqual(cig.run_codex(args, False, 60, time.monotonic())[0], b'image')
+            return stream.call_args.args
+
+    def test_current_and_named_endpoints(self):
+        for name in ('current', 'myrelay'):
+            for base in ('https://relay.example', 'https://relay.example/'):
+                with self.subTest(name=name, base=base):
+                    self.config(base=base)
+                    self.assertEqual(cig._codex_provider(name)['endpoint'], 'https://relay.example/responses')
+
+    def test_headers_and_env_token(self):
+        self.config(extra='[model_providers.myrelay.http_headers]\nX-Static = "static"\nchatgpt-account-id = "discard"\n[model_providers.myrelay.env_http_headers]\nX-Env = "EXTRA_HEADER"\nX-Missing = "UNSET_HEADER"\n')
+        url, headers, payload, *_ = self.run_image()
+        self.assertEqual(url, 'https://relay.example/responses')
+        self.assertEqual(headers['Authorization'], 'Bearer secret-relay-test-value')
+        self.assertNotIn('chatgpt-account-id', headers)
+        self.assertEqual(headers['X-Static'], 'static')
+        self.assertEqual(headers['X-Env'], 'extra')
+        self.assertNotIn('X-Missing', headers)
+        self.assertIn('codex_cli_rs', headers['User-Agent'])
+        self.assertEqual(headers['originator'], 'codex_cli_rs')
+
+    def test_config_token(self):
+        self.config(credential='experimental_bearer_token = "config-secret"')
+        self.assertEqual(self.run_image()[1]['Authorization'], 'Bearer config-secret')
+        self.assertIn('token in config.toml', cig._codex_provider()['detail'])
+
+    def test_driver_defaults_and_override(self):
+        self.assertEqual(self.run_image()[2]['model'], 'configured-driver')
+        self.assertEqual(self.run_image('explicit-driver')[2]['model'], 'explicit-driver')
+        path = Path(self.tmp.name, 'config.toml')
+        path.write_text(path.read_text().replace('model = "configured-driver"\n', ''))
+        self.assertEqual(self.run_image()[2]['model'], cig.CODEX_MODEL_DEFAULT)
+
+    def test_invalid_config(self):
+        cases = [(dict(base=None), 'base_url'),
+                 (dict(extra='wire_api = "chat"\n'), 'wire_api'),
+                 (dict(credential='env_key = "MISSING_TOKEN"'), 'MISSING_TOKEN'),
+                 (dict(credential=''), 'requires')]
+        for kw, expected in cases:
+            with self.subTest(kw=kw):
+                self.config(**kw)
+                with self.assertRaises(cig.GatewayError) as error:
+                    cig._codex_provider()
+                self.assertIn(expected, str(error.exception))
+                self.assertNotIn('secret-relay-test-value', str(error.exception))
+                self.assertFalse(cig._codex_token_present())
+
+    def test_missing_provider_and_current(self):
+        with self.assertRaisesRegex(cig.GatewayError, 'not found'):
+            cig._codex_provider('absent')
+        Path(self.tmp.name, 'config.toml').write_text('')
+        with self.assertRaisesRegex(cig.GatewayError, 'model_provider'):
+            cig._codex_provider('current')
+
+    def test_empty_env_token_does_not_fall_back(self):
+        self.config(credential='env_key = "RELAY_TEST_TOKEN"\nexperimental_bearer_token = "config-secret"')
+        os.environ['RELAY_TEST_TOKEN'] = ''
+        with self.assertRaisesRegex(cig.GatewayError, 'RELAY_TEST_TOKEN') as error:
+            cig._codex_provider()
+        self.assertNotIn('config-secret', str(error.exception))
+
+    def test_disabled_uses_oauth_and_original_endpoint(self):
+        del os.environ['IMAGE_USE_CODEX_PROVIDER']
+        self.assertIsNone(cig._codex_provider())
+        args = argparse.Namespace(gen_prompt='cat', size='auto', format='png', model=None, timeout=60)
+        events = [{'type': 'response.output_item.done', 'item': {
+            'type': 'image_generation_call', 'result': 'aW1hZ2U='}}]
+        with unittest.mock.patch.object(cig, '_load_auth', return_value={}) as auth, \
+             unittest.mock.patch.object(cig, '_extract_access_token', return_value=('oauth', 'account', None)), \
+             unittest.mock.patch.object(cig, '_detect_codex_version', return_value='1.0'), \
+             unittest.mock.patch.object(cig, '_stream', return_value=iter(events)) as stream:
+            cig.run_codex(args, False, 60, time.monotonic())
+            auth.assert_called_once()
+            self.assertEqual(stream.call_args.args[0], cig.CODEX_BACKEND)
+            self.assertEqual(stream.call_args.args[1]['chatgpt-account-id'], 'account')
+
+    def test_doctor_redacted(self):
+        output = io.StringIO()
+        with unittest.mock.patch.object(cig, '_fetch_latest_info', return_value=(None, {})), \
+             unittest.mock.patch.object(cig, '_find_agent_browser', return_value=None), \
+             unittest.mock.patch.object(cig, '_find_agy', return_value=None), redirect_stdout(output):
+            cig._doctor_command(['--codex-provider', 'myrelay'])
+        self.assertIn("relay provider 'myrelay' (relay.example), token from $RELAY_TEST_TOKEN: present", output.getvalue())
+        self.assertNotIn('secret-relay-test-value', output.getvalue())
+
+    def test_remote_error_redacted_no_refresh(self):
+        provider = cig._codex_provider()
+        with unittest.mock.patch.object(cig, '_stream', side_effect=cig.GatewayError('echo ' + provider['token'], status=401)), \
+             unittest.mock.patch.object(cig, '_refresh_access_token') as refresh:
+            with self.assertRaises(SystemExit) as error:
+                cig._run_codex_locked(argparse.Namespace(timeout=60), False, 60,
+                                      time.monotonic(), {}, None, provider['token'], None, '1', {}, provider)
+            self.assertNotIn(provider['token'], str(error.exception))
+            refresh.assert_not_called()
+
+    def test_legacy_provider_environment(self):
+        del os.environ['IMAGE_USE_CODEX_PROVIDER']
+        os.environ['CHATGPT_IMAGEGEN_CODEX_PROVIDER'] = 'myrelay'
+        self.assertTrue(cig._codex_token_present())
+
+    def test_invalid_toml_does_not_echo_secret(self):
+        Path(self.tmp.name, 'config.toml').write_text('secret-relay-test-value invalid TOML')
+        with self.assertRaises(cig.GatewayError) as error:
+            cig._codex_provider()
+        self.assertNotIn('secret-relay-test-value', str(error.exception))
+
+    def test_tomllib_unavailable_only_blocks_provider(self):
+        with unittest.mock.patch.dict(sys.modules, {'tomllib': None}):
+            self.assertIsNone(cig._codex_provider(''))
+            with self.assertRaisesRegex(cig.GatewayError, '3.11'):
+                cig._codex_provider('current')
+
+    def test_model_fallback_reuses_relay(self):
+        provider = cig._codex_provider()
+        payload = {'model': 'unsupported'}
+        with unittest.mock.patch.object(cig, '_post_for_image', side_effect=[
+                cig.GatewayError('not supported when using Codex', status=400),
+                (b'image', {})]) as post:
+            cig._run_codex_locked(argparse.Namespace(timeout=60), False, 60,
+                                  time.monotonic(), payload, None, provider['token'],
+                                  None, '1', {}, provider)
+        self.assertEqual(payload['model'], cig.CODEX_MODEL_FALLBACK)
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(all(c.args[6] == provider['endpoint'] for c in post.call_args_list))
+
+    def test_cli_provider_and_model(self):
+        class Parsed(Exception):
+            pass
+        captured = []
+        def capture(args):
+            captured.append(args)
+            raise Parsed()
+        for flags in ([], ['--codex-provider', 'myrelay', '--model', 'explicit']):
+            with unittest.mock.patch.object(sys, 'argv', ['image-use', 'cat'] + flags), \
+                 unittest.mock.patch.object(cig, '_validate_project_args', side_effect=capture), \
+                 unittest.mock.patch.object(cig, '_maybe_notify_update'):
+                with self.assertRaises(Parsed):
+                    cig.main()
+        self.assertEqual(captured[0].codex_provider, 'current')
+        self.assertIsNone(captured[0].model)
+        self.assertEqual(captured[1].codex_provider, 'myrelay')
+        self.assertEqual(captured[1].model, 'explicit')
+
+    def test_http_error_redacts_before_truncation(self):
+        token = 'secret-relay-test-value'
+        error = cig.urllib.error.HTTPError('https://relay.example', 401, 'error', {},
+                                          io.BytesIO(('x' * 590 + token).encode()))
+        with unittest.mock.patch.object(cig, '_stream', side_effect=error):
+            with self.assertRaises(cig.GatewayError) as caught:
+                cig._post_for_image({}, {}, time.monotonic() + 60, time.monotonic(),
+                                    60, False, 'https://relay.example/responses', token)
+        self.assertNotIn('secret-rel', str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

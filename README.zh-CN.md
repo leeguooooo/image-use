@@ -206,3 +206,31 @@ MIT —— 见 [LICENSE](./LICENSE)。
 ## 作者
 
 **郭立（Guo Li / leeguoo）** 开发 —— [leeguoo.com](https://leeguoo.com/about) · [GitHub](https://github.com/leeguooooo) · [X](https://x.com/leeguooooo) · 更多工具见 [*-use 家族](https://github.com/leeguooooo/plugins)。
+
+### 自定义 Codex Responses 中转站
+
+使用 `--backend codex --codex-provider current`，或设置
+`IMAGE_USE_CODEX_PROVIDER=current`，即可读取 `$CODEX_HOME/config.toml`
+（默认 `~/.codex/config.toml`）顶层 `model_provider`。
+`--codex-provider myrelay` 则直接选择 `[model_providers.myrelay]`。
+此模式需要 Python 3.11+；未设置或留空时，原有 ChatGPT OAuth 路径保持不变，
+仍支持 Python 3.10+。
+
+```toml
+model = "gpt-6-astra"
+model_provider = "myrelay"
+[model_providers.myrelay]
+base_url = "https://relay.example"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "MYRELAY_API_KEY"
+```
+
+通过安全渠道向进程环境注入 `MYRELAY_API_KEY`，建议使用 `env_key`，不要把令牌
+明文写进配置的 `experimental_bearer_token`。端点为去掉尾部斜杠的 `base_url`
+加 `/responses`，中转站需支持 Responses 的 `image_generation` 工具。
+此模式不读取或刷新 ChatGPT OAuth，也不发送 ChatGPT account ID。
+顶层 `model` 作为默认驱动模型，`--model` 或 `IMAGE_USE_MODEL` 可覆盖。
+支持静态 `http_headers` 和 `env_http_headers`（请求头名 → 环境变量名），
+后者变量不存在时跳过。运行 `image-use doctor --codex-provider current`
+检查配置与令牌是否就绪，输出不显示令牌值。
