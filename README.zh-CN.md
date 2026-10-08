@@ -223,11 +223,18 @@ model_provider = "myrelay"
 base_url = "https://relay.example"
 wire_api = "responses"
 requires_openai_auth = false
-env_key = "MYRELAY_API_KEY"
+auth = { command = "/usr/local/bin/get-token", args = ["--name", "relay"], timeout_ms = 15000, refresh_interval_ms = 3600000 }
 ```
 
-通过安全渠道向进程环境注入 `MYRELAY_API_KEY`，建议使用 `env_key`，不要把令牌
-明文写进配置的 `experimental_bearer_token`。端点为去掉尾部斜杠的 `base_url`
+推荐使用 `auth.command`：桌面版 Codex 也能使用，令牌无需落盘或进入环境变量。
+命令与 `args` 直接执行，不经过 shell；stdout 去掉首尾空白后作为 Bearer 令牌。
+`auth` 必须是表，`command` 必须是非空字符串；可选 `args` 必须是字符串列表，
+`timeout_ms` 必须是正整数（默认 15000），可选字符串 `cwd` 指定工作目录。
+单次运行的 CLI 忽略 `refresh_interval_ms`；同一进程内每个 provider 的命令只执行一次，
+成功与失败结果都会缓存。优先级为 `env_key` → `auth.command` →
+`experimental_bearer_token`；选中来源失败时直接报错，不回退。
+也可通过安全渠道向进程环境注入令牌并设置 `env_key = "MYRELAY_API_KEY"`，
+避免使用明文配置的 `experimental_bearer_token`。端点为去掉尾部斜杠的 `base_url`
 加 `/responses`，中转站需支持 Responses 的 `image_generation` 工具。
 此模式不读取或刷新 ChatGPT OAuth，也不发送 ChatGPT account ID。
 顶层 `model` 作为默认驱动模型，`--model` 或 `IMAGE_USE_MODEL` 可覆盖。

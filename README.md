@@ -250,11 +250,20 @@ model_provider = "myrelay"
 base_url = "https://relay.example"
 wire_api = "responses"
 requires_openai_auth = false
-env_key = "MYRELAY_API_KEY"
+auth = { command = "/usr/local/bin/get-token", args = ["--name", "relay"], timeout_ms = 15000, refresh_interval_ms = 3600000 }
 ```
 
-Supply `MYRELAY_API_KEY` securely in the process environment; prefer `env_key`
-over a plaintext `experimental_bearer_token` in config. The endpoint is
+Recommended: use `auth.command`, which also works in desktop Codex and keeps the
+returned token out of config files and environment variables. The command and
+`args` run directly without a shell; trimmed stdout becomes the Bearer token.
+`auth` must be a table with a nonempty string `command`. Optional `args` must be
+a string list; `timeout_ms` must be a positive integer (default 15000); optional
+string `cwd` sets the working directory. This one-shot CLI ignores
+`refresh_interval_ms` and caches command success or failure once per provider
+per process. Priority is `env_key` → `auth.command` → `experimental_bearer_token`;
+failure of the selected source does not fall back. Alternatively, set
+`env_key = "MYRELAY_API_KEY"` and inject the token securely into the process
+environment; avoid plaintext `experimental_bearer_token` in config. The endpoint is
 `base_url.rstrip("/") + "/responses"`; the relay must support the Responses
 `image_generation` tool. Provider mode uses no ChatGPT OAuth or account ID.
 The top-level `model` supplies the driver default; `--model` (or

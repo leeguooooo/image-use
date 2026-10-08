@@ -1190,6 +1190,49 @@ def _warn_if_chrome_use_old(ab: str, emit) -> None:
         )
 
 
+# Cache failures too: readiness checks must not rerun credential commands.
+_CODEX_AUTH_COMMAND_CACHE: dict[tuple[str, str], tuple[bool, str]] = {}
+
+
+def _codex_auth_command(auth, cache_key) -> tuple[str, str]:
+    if not isinstance(auth, dict):
+        raise GatewayError("provider auth must be a table")
+    command = auth.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise GatewayError("provider auth.command must be a nonempty string")
+    args = auth.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise GatewayError("provider auth.args must be a string list")
+    timeout_ms = auth.get("timeout_ms", 15000)
+    if type(timeout_ms) is not int or timeout_ms <= 0:
+        raise GatewayError("provider auth.timeout_ms must be a positive integer")
+    if "cwd" in auth and not isinstance(auth["cwd"], str):
+        raise GatewayError("provider auth.cwd must be a string")
+    basename = os.path.basename(command)
+    if cache_key not in _CODEX_AUTH_COMMAND_CACHE:
+        options = {"cwd": auth["cwd"]} if "cwd" in auth else {}
+        try:
+            result = subprocess.run([command, *args], capture_output=True, text=True,
+                                    timeout=timeout_ms / 1000, stdin=subprocess.DEVNULL,
+                                    **options)
+        except subprocess.TimeoutExpired:
+            outcome = (False, f"auth command ({basename}): timed out")
+        except (OSError, ValueError, UnicodeError):
+            outcome = (False, f"auth command ({basename}): could not execute or read token")
+        else:
+            if result.returncode != 0:
+                outcome = (False, f"auth command ({basename}): exit code {result.returncode}")
+            elif not result.stdout.strip():
+                outcome = (False, f"auth command ({basename}): empty stdout")
+            else:
+                outcome = (True, result.stdout.strip())
+        _CODEX_AUTH_COMMAND_CACHE[cache_key] = outcome
+    ok, value = _CODEX_AUTH_COMMAND_CACHE[cache_key]
+    if not ok:
+        raise GatewayError(value) from None
+    return value, f"token from auth command ({basename}): present"
+
+
 def _codex_provider(name: str | None = None) -> JsonDict | None:
     """Resolve opt-in Responses providers without touching ChatGPT credentials."""
     name = _env("IMAGE_USE_CODEX_PROVIDER", "") if name is None else name
@@ -1215,14 +1258,17 @@ def _codex_provider(name: str | None = None) -> JsonDict | None:
         raise GatewayError(f"Codex provider {name!r} not found in {path}")
     token = provider.get("experimental_bearer_token")
     env_key = provider.get("env_key")
+    source = "token in config.toml"
     if env_key is not None:
         if not isinstance(env_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
             raise GatewayError("invalid provider env_key")
         token = os.environ.get(env_key)
         if not token:
             raise GatewayError(f"provider token environment variable ${env_key} is missing or empty")
+    elif "auth" in provider:
+        token, source = _codex_auth_command(provider["auth"], (str(path.resolve()), name))
     if not isinstance(token, str) or not token.strip():
-        raise GatewayError("provider requires env_key or experimental_bearer_token")
+        raise GatewayError("provider requires env_key, auth.command or experimental_bearer_token")
     def safe(text):
         return str(text).replace(token, "[redacted]")
     base = provider.get("base_url")
@@ -1249,7 +1295,7 @@ def _codex_provider(name: str | None = None) -> JsonDict | None:
                 headers[key] = value
     # A relay must never inherit an account identifier, even from custom headers.
     headers = {k: v for k, v in headers.items() if k.lower() not in ("chatgpt-account-id", "authorization")}
-    source = f"token from ${env_key}: present" if env_key else "token in config.toml"
+    source = f"token from ${env_key}: present" if env_key else source
     return dict(token=token, headers=headers, endpoint=base.rstrip("/") + "/responses",
                 model=config.get("model"), detail=safe(f"relay provider '{name}' ({url.hostname}), {source}"))
 
