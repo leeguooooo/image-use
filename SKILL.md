@@ -1,6 +1,6 @@
 ---
 name: "image-use"
-version: "0.33.0"
+version: "0.34.0"
 description: >-
   Backend-neutral image generation: create new raster images and looping
   GIF/WebP animations through the local one-file image-use CLI (formerly

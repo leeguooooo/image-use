@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.33.0"
+__version__ = "0.34.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.34.0]: codex relay providers can get the token from an auth command (provider auth = { command, args, timeout_ms, cwd }), so the Codex desktop app works without shell env vars; token source order is env_key, then auth.command, then experimental_bearer_token; the command runs once per provider and its output never appears in errors (#47, thanks @Sean529)
 # WHATSNEW[0.33.0]: codex backend can use a custom Responses relay from ~/.codex/config.toml: --codex-provider current|<name> (IMAGE_USE_CODEX_PROVIDER); token from env_key or experimental_bearer_token, redacted from errors and logs; needs Python 3.11+, no change when unset (#46, thanks @Sean529)
 # WHATSNEW[0.32.0]: --project accepts a ChatGPT Project link and opens that project; new --require-project (IMAGE_USE_REQUIRE_PROJECT=1) stops when the project can't be opened instead of falling back to a plain chat or to Codex; --no-require-project turns it off for one run (#45, thanks @IndelibleVivi)
 # WHATSNEW[0.31.0]: new `image-use recover <conversation-url>`: download an image that arrived after a web timeout without resubmitting; timeout errors now print the conversation link and this command (needs `chrome-use site update` for chatgpt/images)
