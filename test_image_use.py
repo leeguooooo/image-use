@@ -4924,6 +4924,8 @@ class RequiredProjectDispatch(unittest.TestCase):
 @unittest.skipIf(sys.version_info < (3, 11), "provider TOML requires Python 3.11+")
 class CodexRelayProvider(unittest.TestCase):
     def setUp(self):
+        cig._CODEX_AUTH_COMMAND_CACHE.clear()
+        self.addCleanup(cig._CODEX_AUTH_COMMAND_CACHE.clear)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.env = unittest.mock.patch.dict(os.environ, {
@@ -4978,6 +4980,110 @@ class CodexRelayProvider(unittest.TestCase):
              self.assertRaises(SystemExit) as caught:
             cig.run_codex(args, False, 60, time.monotonic())
         self.assertIn("'missing' not found", str(caught.exception.code))
+
+    def command_config(self, fields='', prefix=''):
+        self.config(credential=prefix + '\nauth = { command = "/usr/local/bin/get-token"' + fields + ' }')
+
+    def test_auth_command_authorization_and_defaults(self):
+        self.command_config()
+        with unittest.mock.patch.object(cig.subprocess, 'run', return_value=
+                subprocess.CompletedProcess([], 0, '  command-secret\n', 'stderr-secret')) as run:
+            self.assertEqual(self.run_image()[1]['Authorization'], 'Bearer command-secret')
+        run.assert_called_once_with(['/usr/local/bin/get-token'], capture_output=True,
+                                    text=True, timeout=15, stdin=subprocess.DEVNULL)
+
+    def test_auth_command_priority(self):
+        for prefix, expected, calls in (
+                ('env_key = "RELAY_TEST_TOKEN"', 'secret-relay-test-value', 0),
+                ('experimental_bearer_token = "config-secret"', 'command-secret', 1)):
+            with self.subTest(prefix=prefix):
+                self.command_config(prefix=prefix)
+                with unittest.mock.patch.object(cig.subprocess, 'run', return_value=
+                        subprocess.CompletedProcess([], 0, 'command-secret', '')) as run:
+                    self.assertEqual(cig._codex_provider()['token'], expected)
+                    self.assertEqual(run.call_count, calls)
+
+    def test_auth_command_args_timeout_and_cwd(self):
+        self.command_config(', args = ["--name", "relay", "$(echo unsafe)"], timeout_ms = 2500, cwd = "/tmp", refresh_interval_ms = 3600000')
+        with unittest.mock.patch.object(cig.subprocess, 'run', return_value=
+                subprocess.CompletedProcess([], 0, 'token', '')) as run:
+            cig._codex_provider()
+        run.assert_called_once_with(['/usr/local/bin/get-token', '--name', 'relay', '$(echo unsafe)'],
+                                    capture_output=True, text=True, timeout=2.5,
+                                    stdin=subprocess.DEVNULL, cwd='/tmp')
+
+    def test_auth_command_failures_redacted_and_cached(self):
+        outcomes = [FileNotFoundError('stdout-secret stderr-secret'),
+                    subprocess.TimeoutExpired('get-token', 15, output='stdout-secret', stderr='stderr-secret'),
+                    subprocess.CompletedProcess([], 7, 'stdout-secret', 'stderr-secret'),
+                    subprocess.CompletedProcess([], 0, '  \n', 'stderr-secret')]
+        for outcome, expected in zip(outcomes, ['could not execute', 'timed out', 'exit code 7', 'empty stdout']):
+            with self.subTest(expected=expected):
+                cig._CODEX_AUTH_COMMAND_CACHE.clear()
+                self.command_config(prefix='experimental_bearer_token = "fallback-secret"')
+                kwargs = {'side_effect': outcome} if isinstance(outcome, Exception) else {'return_value': outcome}
+                with unittest.mock.patch.object(cig.subprocess, 'run', **kwargs) as run:
+                    with self.assertRaises(cig.GatewayError) as error:
+                        cig._codex_provider()
+                    self.assertIn('get-token', str(error.exception))
+                    self.assertIn(expected, str(error.exception))
+                    for secret in ('stdout-secret', 'stderr-secret', 'fallback-secret', '/usr/local/bin'):
+                        self.assertNotIn(secret, str(error.exception))
+                    self.assertFalse(cig._codex_token_present())
+                    run.assert_called_once()
+
+    def test_auth_command_once_for_current_named_and_request(self):
+        self.command_config()
+        with unittest.mock.patch.object(cig.subprocess, 'run', return_value=
+                subprocess.CompletedProcess([], 0, 'command-secret', '')) as run:
+            self.assertTrue(cig._codex_token_present())
+            self.assertEqual(cig._codex_provider('myrelay')['token'], 'command-secret')
+            self.assertEqual(self.run_image()[1]['Authorization'], 'Bearer command-secret')
+            run.assert_called_once()
+
+    def test_auth_command_cache_isolated_by_provider(self):
+        self.command_config()
+        path = Path(self.tmp.name, 'config.toml')
+        path.write_text(path.read_text() + '\n[model_providers.other]\nbase_url = "https://relay.example"\nauth = { command = "other-token" }\n')
+        with unittest.mock.patch.object(cig.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, 'first', ''),
+                subprocess.CompletedProcess([], 0, 'second', '')]) as run:
+            self.assertEqual(cig._codex_provider()['token'], 'first')
+            self.assertEqual(cig._codex_provider('other')['token'], 'second')
+            self.assertEqual(run.call_count, 2)
+
+    def test_auth_command_invalid_fields(self):
+        values = ['"not a table"', '{}', '{ command = "" }', '{ command = "  " }',
+                  '{ command = 42 }', '{ command = "get-token", args = "arg" }',
+                  '{ command = "get-token", args = [42] }',
+                  '{ command = "get-token", timeout_ms = 0 }',
+                  '{ command = "get-token", timeout_ms = -1 }',
+                  '{ command = "get-token", timeout_ms = true }',
+                  '{ command = "get-token", timeout_ms = 1.5 }',
+                  '{ command = "get-token", cwd = 42 }']
+        for value in values:
+            with self.subTest(value=value), unittest.mock.patch.object(cig.subprocess, 'run') as run:
+                self.config(credential='auth = ' + value)
+                with self.assertRaises(cig.GatewayError):
+                    cig._codex_provider()
+                run.assert_not_called()
+
+    def test_doctor_auth_command_success_and_failure(self):
+        for rc in (0, 9):
+            with self.subTest(rc=rc):
+                cig._CODEX_AUTH_COMMAND_CACHE.clear()
+                self.command_config()
+                output = io.StringIO()
+                with unittest.mock.patch.object(cig.subprocess, 'run', return_value=
+                        subprocess.CompletedProcess([], rc, 'command-secret', 'stderr-secret')), \
+                     unittest.mock.patch.object(cig, '_fetch_latest_info', return_value=(None, {})), \
+                     unittest.mock.patch.object(cig, '_find_agent_browser', return_value=None), \
+                     unittest.mock.patch.object(cig, '_find_agy', return_value=None), redirect_stdout(output):
+                    cig._doctor_command(['--codex-provider', 'myrelay'])
+                expected = 'token from auth command (get-token): present' if rc == 0 else 'auth command (get-token): exit code 9'
+                self.assertIn(expected, output.getvalue())
+                self.assertNotIn('command-secret', output.getvalue())
+                self.assertNotIn('stderr-secret', output.getvalue())
 
     def test_config_token(self):
         self.config(credential='experimental_bearer_token = "config-secret"')
