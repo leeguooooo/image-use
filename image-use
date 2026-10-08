@@ -74,7 +74,7 @@ __version__ = "0.33.0"
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
-# WHATSNEW[0.33.0]: codex 后端支持 ~/.codex/config.toml 里的自定义 Responses 中转站:--codex-provider current|<名字>(IMAGE_USE_CODEX_PROVIDER),令牌走 env_key 或 experimental_bearer_token,报错和日志都遮掉令牌;需 Python 3.11+,不设时行为不变(#46,感谢 @Sean529)
+# WHATSNEW[0.33.0]: codex backend can use a custom Responses relay from ~/.codex/config.toml: --codex-provider current|<name> (IMAGE_USE_CODEX_PROVIDER); token from env_key or experimental_bearer_token, redacted from errors and logs; needs Python 3.11+, no change when unset (#46, thanks @Sean529)
 # WHATSNEW[0.32.0]: --project 可直接传 ChatGPT Project 链接打开指定项目;新增 --require-project(IMAGE_USE_REQUIRE_PROJECT=1):进不了项目就停下,不退回普通对话、不回落 Codex,--no-require-project 单次关闭(#45,感谢 @IndelibleVivi)
 # WHATSNEW[0.31.0]: 新增 image-use recover <会话链接>:web 超时后图晚到也能直接下载,不用重新提交;超时报错会给出会话链接和这条命令(需要 chrome-use site update 装上 chatgpt/images)
 # WHATSNEW[0.30.2]: web 后端出图不再在约 16 秒无图后误报失败:同一张新图连续两次读到才算完成,否则等满 --timeout;正文以英文额度/拒绝提示开头时立即报错;报错附上 ChatGPT 原话并提醒先看原会话再重试(#44)
