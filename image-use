@@ -1383,14 +1383,19 @@ def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | Non
     return proc.stdout
 
 
-def _ab_eval(ab: str, js: str, session: str, timeout: float) -> Any:
+def _ab_eval(ab: str, js: str, session: str, timeout: float,
+             *, stdin: bool = False) -> Any:
     """Run JS in the page and decode the value it returns.
 
     Convention: the JS always `return JSON.stringify(value)`. chrome-use
     prints that string JSON-encoded, so we decode twice — once to recover the
     JSON text the page returned, once to parse it into a Python object.
+    ``stdin`` carries scripts containing long prompt text without argv limits.
     """
-    out = _ab(ab, "eval", js, session=session, timeout=timeout)
+    if stdin:
+        out = _ab(ab, "eval", "--stdin", input_text=js, session=session, timeout=timeout)
+    else:
+        out = _ab(ab, "eval", js, session=session, timeout=timeout)
     # Scan from the last non-empty line for the first that decodes to a string.
     for line in reversed([l for l in out.splitlines() if l.strip()]):
         try:
@@ -1603,31 +1608,94 @@ def _wait_composer(ab: str, session: str, remaining, tries: int = 15) -> bool:
     return False
 
 
-def _enter_project(ab: str, session: str, name: str, remaining, emit) -> None:
-    """Navigate the open session into the named ChatGPT Project, creating the
-    project on first use — so each run's conversation files under the project
-    instead of littering the top-level chat history.
+def _project_url_id(target: str) -> str | None:
+    """Return a landing URL's stable Project ID, or None for a display name.
 
-    Best-effort: organization is a nicety, the generation is the point. On any
-    failure this warns and restores a plain new chat, never aborts the run.
+    URL-like mistakes must not reach the name/create API. Display slugs and
+    query/fragment decorations are optional; navigation uses only the ID.
     """
+    target = target.strip()
+    if not re.match(r"(?:[a-z][a-z0-9+.-]*://|https?:|//|(?:www\.)?chatgpt\.com(?:[/?#]|$))",
+                    target, re.I):
+        return None
+    try:
+        url = urllib.parse.urlsplit(target)
+        path = urllib.parse.unquote(url.path, errors="strict")
+        match = re.fullmatch(r"/g/(g-p-[0-9a-f]{32})(?:-[^/\\?#]+)?/project/?", path, re.I)
+        if (url.scheme == "https" and url.netloc.lower() == "chatgpt.com"
+                and match and not re.search(r"[\x00-\x1f\x7f]", target)):
+            return match[1].lower()
+    except (ValueError, UnicodeError):
+        pass
+    raise GatewayError("--project needs a name or an HTTPS ChatGPT Project URL "
+                       "(https://chatgpt.com/g/g-p-<32-hex-id>/project)")
+
+
+def _validate_project_args(args) -> None:
+    """Reject invalid targets and incompatible required routes before backend work."""
+    target = (getattr(args, "project", None) or "").strip()
+    _project_url_id(target)
+    if getattr(args, "require_project", False):
+        if not target:
+            raise GatewayError("--require-project needs a non-empty --project target")
+        if args.backend not in ("web", "auto"):
+            raise GatewayError("--require-project only supports --backend web or auto")
+
+
+# Read only the Project identity on either its landing page or a conversation.
+# The display slug may change or be localized; a prefix of another ID is never
+# a match. This same expression is embedded in the guarded Send operation.
+_JS_PROJECT_ID = r"""(() => {
+  const m = location.pathname.match(/^\/g\/(g-p-[0-9a-f]{32})(?:-[^/\\?#]+)?\/(?:project\/?|c\/[^/]+\/?)$/i);
+  return JSON.stringify(location.origin === 'https://chatgpt.com' && m
+    ? m[1].toLowerCase() : null);
+})()"""
+
+
+def _assert_web_project(ab, session, project_id, remaining) -> None:
+    """Require the expected Project route; an unreadable route also stops the run."""
+    actual = _ab_eval(ab, _JS_PROJECT_ID, session=session,
+                      timeout=min(15.0, remaining()))
+    if actual != project_id:
+        raise GatewayError("required ChatGPT Project could not be verified; "
+                           "prompt not submitted. Check the Project URL and access.")
+
+
+def _enter_project(ab: str, session: str, target: str, remaining, emit,
+                   *, require: bool = False) -> str | None:
+    """Open a Project URL directly, or find/create an exact display name.
+
+    Legacy best-effort routing warns and restores a plain chat on failure.
+    Required routing propagates failures and verifies the opened Project ID.
+    """
+    project_id = _project_url_id(target)  # invalid URLs never become names
     navigated = False
     try:
-        res = _ab_eval(ab, _JS_ENSURE_PROJECT % json.dumps(name),
-                       session=session, timeout=min(30.0, remaining()))
-        if not isinstance(res, dict) or not res.get("ok") or not res.get("id"):
-            detail = res.get("error") if isinstance(res, dict) else res
-            raise GatewayError(f"could not resolve project: {detail}")
-        emit(f"using project {name!r}" + (" (created)" if res.get("created") else ""))
+        created = False
+        if project_id is None:
+            res = _ab_eval(ab, _JS_ENSURE_PROJECT % json.dumps(target),
+                           session=session, timeout=min(30.0, remaining()))
+            if not isinstance(res, dict) or not res.get("ok") or not re.fullmatch(
+                    r"g-p-[0-9a-f]{32}", str(res.get("id") or ""), re.I):
+                detail = res.get("error") if isinstance(res, dict) else res
+                raise GatewayError(f"could not resolve project: {detail}")
+            project_id = res["id"].lower()
+            created = res.get("created")
+        emit(f"using project {target!r}" + (" (created)" if created else ""))
         navigated = True
-        _ab(ab, "open", WEB_PROJECT_URL.format(gizmo_id=res["id"]),
+        _ab(ab, "open", WEB_PROJECT_URL.format(gizmo_id=project_id),
             session=session, timeout=min(30.0, remaining()))
         if not _wait_composer(ab, session, remaining):
             raise GatewayError("project page composer never appeared")
+        if require:
+            _assert_web_project(ab, session, project_id, remaining)
+        return project_id
     except WebRateLimited:
         raise  # account-level block; a plain chat would be just as dead
     except GatewayError as e:
-        emit(f"warning: project {name!r} unavailable ({e}); using a plain chat")
+        if require:
+            raise GatewayError(f"required project unavailable: {e}") from e
+        emit(f"warning: project {target!r} unavailable ({e}); using a plain chat")
         if navigated:
             # We may have left the plain-chat page; restore it so the normal
             # submit flow still has a composer to type into.
@@ -2050,6 +2118,7 @@ def run_web(
 
     Returns (image_bytes, meta). Raises GatewayError / exits on failure.
     """
+    _validate_project_args(args)
     ab = _find_agent_browser()
     if ab is None:
         raise WebUnavailable(f"`chrome-use` is not installed — {_AB_INSTALL_HINT}")
@@ -2172,14 +2241,19 @@ def run_web(
     # exception — instead of leaking a window on every non-happy path.
     try:
         project = (args.project or "").strip()
+        required_project_id = None
         if project:
-            _enter_project(ab, session, project, remaining, emit)
+            project_id = _enter_project(ab, session, project, remaining, emit,
+                                        require=getattr(args, "require_project", False))
+            if getattr(args, "require_project", False):
+                required_project_id = project_id
         _ensure_web_model(
             ab, session,
             getattr(args, "web_model", WEB_MODEL_DEFAULT) or WEB_MODEL_DEFAULT,
             remaining, emit)
         result = _generate_in_browser(
-            ab, session, user_text, args, deadline, remaining, emit, refs=refs)
+            ab, session, user_text, args, deadline, remaining, emit, refs=refs,
+            required_project_id=required_project_id)
         # Image is saved by now. Delete the conversation so no history is left —
         # the default. `--keep-conversation` opts out; `--keep-tab` (debugging)
         # implies keeping it, since an open tab on a deleted chat is useless.
@@ -2375,23 +2449,89 @@ def _canonicalize_composer_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
 
 
-def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
+# Arm only this document's Send button, then use chrome-use's normal native
+# click. A capture listener rechecks route/state at the event, before the app
+# handles it. Navigation replaces the document/marker; SPA route changes are
+# checked by the listener. A DOM-only click can leave a local provisional chat
+# without a server conversation, so keep the normal trusted browser interaction.
+_JS_ARM_PROJECT_SEND = r"""(() => {
+  const expected = %s;
+  const token = %s;
+  const fail = error => JSON.stringify({ok: false, error});
+  const normalize = text => (text || '').replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ');
+  const check = () => {
+    if (JSON.parse(%s) !== expected) return 'Project route changed or is unverifiable';
+    const state = JSON.parse(%s);
+    if (!state.exists || normalize(state.text) !== normalize(%s) ||
+        state.attachments !== %s || state.ready !== state.attachments ||
+        state.user_turns !== %s || state.busy || !state.send_ready)
+      return 'composer text, attachments, or Send state changed';
+    if (document.querySelector('[role="dialog"]')) return 'a dialog is open';
+    return null;
+  };
+  const error = check();
+  if (error) return fail(error);
+  const composer = document.querySelector(%s);
+  const send = composer && composer.closest('form').querySelector(%s);
+  if (!send) return fail('Send unavailable');
+  const attr = 'data-image-use-project-send';
+  const selector = '[' + attr + '="' + token + '"]';
+  const result = {ok: null};
+  const handler = event => {
+    const target = event.target.closest && event.target.closest(selector);
+    if (!target) return;
+    const error = target !== send ? 'Send target changed' : check();
+    if (error) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      result.ok = false;
+      result.error = error;
+    } else result.ok = true;
+    send.removeAttribute(attr);
+    window.removeEventListener('click', handler, true);
+  };
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (send.getAttribute(attr) === token) send.removeAttribute(attr);
+    window.removeEventListener('click', handler, true);
+    delete window[token];
+  };
+  // If the CLI disappears, remove our marker/listener without clearing text.
+  // A delayed native click can no longer find its marked target after expiry.
+  const timer = setTimeout(cleanup, 30000);
+  window[token] = {finish: () => { cleanup(); return result; }};
+  send.setAttribute(attr, token);
+  window.addEventListener('click', handler, true);
+  return JSON.stringify({ok: true});
+})()"""
+
+
+def _finish_project_send_guard(ab, session, token, remaining):
+    """Read this guard's result and remove only its own listener/marker."""
+    key = json.dumps(token)
+    return _ab_eval(ab, f"JSON.stringify(window[{key}] ? window[{key}].finish() : null)",
+                    session=session, timeout=min(15.0, remaining()))
+
+
+def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit,
+                       *, required_project_id=None) -> None:
     """Paste, verify exact editor text and attachments, then click Send once.
 
     `keyboard type` dispatches Enter for newlines and can submit several partial
     messages. `fill --stdin` inserts paragraphs without any submit key events.
     Never replay an uncertain send: a retry could consume quota twice.
     """
+    if required_project_id:
+        _assert_web_project(ab, session, required_project_id, remaining)
     initial = _web_composer_state(ab, session, remaining)
     if initial.get("text"):
         raise GatewayError("ChatGPT composer is not empty; prompt not submitted. " + _DRAFT_HINT)
     emit("pasting prompt")
     _ab(ab, "fill", WEB_COMPOSER_SEL, "--stdin", input_text=user_text,
         session=session, timeout=min(60.0, remaining()))
-    # Everything below until the click is a "nothing was sent" failure. ChatGPT
-    # keeps composer drafts across chats, so leaving our text in the box would
-    # make every LATER run stop at the empty-composer check above until the user
-    # clears it by hand — undo the paste before propagating.
+    # ChatGPT keeps drafts across chats. Legacy mode undoes the paste on a
+    # pre-click failure so it does not block later runs; required mode preserves
+    # the current draft because the route or its ownership may have changed.
     try:
         ready_deadline = time.monotonic() + min(30.0, remaining())
         for _ in range(30):
@@ -2415,18 +2555,54 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
         else:
             raise GatewayError("ChatGPT Send button did not become ready; prompt not submitted")
     except GatewayError:
-        _clear_web_composer(ab, session, remaining)
+        if not required_project_id:
+            _clear_web_composer(ab, session, remaining)
+        # Required mode may have lost its route or draft ownership. Preserve
+        # the current composer instead of clearing someone else's draft.
         raise
     emit(f"verified prompt ({len(user_text)} characters) and {n_refs} reference image(s)")
     send_error = None
+    send_selector = WEB_SEND_CLICK_SEL
+    guard_token = None
+    if required_project_id:
+        guard_token = "imageUseProjectSend_" + uuid.uuid4().hex
+        js = _JS_ARM_PROJECT_SEND % (
+            json.dumps(required_project_id), json.dumps(guard_token), _JS_PROJECT_ID,
+            _JS_WEB_COMPOSER_STATE % _js_composer_selectors(),
+            json.dumps(user_text), n_refs, initial.get("user_turns", 0),
+            json.dumps(WEB_COMPOSER_SEL), json.dumps(WEB_SEND_SEL))
+        try:
+            armed = _ab_eval(ab, js, session=session, timeout=min(20.0, remaining()), stdin=True)
+            if not isinstance(armed, dict) or armed.get("ok") is not True:
+                detail = armed.get("error") if isinstance(armed, dict) else "guard unavailable"
+                raise GatewayError(str(detail))
+        except GatewayError as error:
+            try:
+                _finish_project_send_guard(ab, session, guard_token, remaining)
+            except GatewayError:
+                pass
+            raise GatewayError(f"required Project Send stopped: {error}; prompt not submitted. "
+                               "Draft retained; inspect it before retrying.") from error
+        send_selector = f'button[data-image-use-project-send="{guard_token}"]'
     try:
-        _ab(ab, "click", WEB_SEND_CLICK_SEL,
-            session=session, timeout=min(20.0, remaining()))
+        _ab(ab, "click", send_selector, session=session, timeout=min(20.0, remaining()))
     except GatewayError as error:
         send_error = error
+    if guard_token:
+        try:
+            guarded = _finish_project_send_guard(ab, session, guard_token, remaining)
+        except GatewayError as error:
+            guarded, send_error = None, send_error or error
+        if isinstance(guarded, dict) and guarded.get("ok") is False:
+            raise GatewayError(f"required Project Send stopped: {guarded.get('error')}; "
+                               "prompt not submitted. Draft retained; inspect it before retrying.")
+        if not isinstance(guarded, dict) or guarded.get("ok") is not True:
+            send_error = send_error or GatewayError("guarded Send outcome unknown")
     sent_deadline = time.monotonic() + min(30.0, remaining())
     for _ in range(30):
         try:
+            if required_project_id:
+                _assert_web_project(ab, session, required_project_id, remaining)
             state = _web_composer_state(ab, session, remaining)
         except GatewayError:
             state = {}
@@ -2485,11 +2661,13 @@ def _recover_hint(ab, session) -> str:
 
 
 def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit,
-                         refs=None):
+                         refs=None, required_project_id=None):
     """Upload references, submit verified text once, and download the new image."""
     # Image-to-image: attach the reference(s) to the composer FIRST, then delete
     # any temp downloads — the browser has uploaded the bytes to ChatGPT by the
     # time the thumbnail renders, so the local copy is no longer needed.
+    if required_project_id:
+        _assert_web_project(ab, session, required_project_id, remaining)
     if refs:
         ref_paths: list[str] = []
         cleanups: list[str] = []
@@ -2516,7 +2694,8 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
     if not isinstance(baseline, list):
         baseline = []
 
-    _submit_web_prompt(ab, session, user_text, len(refs or []), remaining, emit)
+    _submit_web_prompt(ab, session, user_text, len(refs or []), remaining, emit,
+                       required_project_id=required_project_id)
 
     # Poll until the stream stops AND a brand-new image asset is present and
     # stable across two reads (guards against grabbing a mid-render partial).
@@ -3906,6 +4085,11 @@ def _dispatch(
     web   : force web; any failure is fatal (with guidance).
     codex : force codex.
     """
+    try:
+        _validate_project_args(args)
+    except GatewayError as e:
+        sys.exit(str(e))
+
     def note(msg: str) -> None:
         if progress:
             print(_fmt_progress(time.monotonic() - start, msg), file=sys.stderr)
@@ -3992,6 +4176,9 @@ def _dispatch(
             with _concurrency_slot("web", web_limit, progress, start):
                 result = run_web(args, progress, start, refs=refs)
     except WebUnavailable as e:
+        if getattr(args, "require_project", False):
+            sys.exit(f"required Project needs the web backend: {e}\n"
+                     "Codex fallback is disabled by --require-project.")
         if _codex_token_present():
             if _find_agent_browser() is None:
                 # chrome-use isn't installed. Keep this to a *gentle* one-line
@@ -4015,6 +4202,8 @@ def _dispatch(
             "or codex login."
         )
     except GatewayError as e:
+        if getattr(args, "require_project", False):
+            sys.exit(str(e))
         # Web was available but failed mid-generation. Don't silently burn the
         # Codex bucket; surface it and let the user decide (--backend codex).
         sys.exit(
@@ -6472,10 +6661,20 @@ def main() -> int:
     parser.add_argument(
         "--project",
         default=_env("IMAGE_USE_PROJECT", DEFAULT_PROJECT),
+        metavar="NAME_OR_URL",
         help="(web backend) ChatGPT Project to file the conversation under — "
-             f"found by exact name, created if absent (default: {DEFAULT_PROJECT!r}; "
-             "also settable via IMAGE_USE_PROJECT). Pass an empty string "
-             "to use a plain top-level chat instead.",
+             "an existing Project landing URL, or an exact name (created if absent). "
+             f"Default: {DEFAULT_PROJECT!r}; "
+             "also settable via IMAGE_USE_PROJECT. Pass an empty string "
+             "to use a plain top-level chat instead. Best-effort unless --require-project.",
+    )
+    parser.add_argument(
+        "--require-project",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("IMAGE_USE_REQUIRE_PROJECT"),
+        help="Require a non-empty --project and verified Project routing before Send. "
+             "Only web/auto; disables Codex fallback. Does not imply --keep-conversation. "
+             "Also IMAGE_USE_REQUIRE_PROJECT=1; --no-require-project overrides it for one run.",
     )
     parser.add_argument(
         "--web-model",
@@ -6547,6 +6746,10 @@ def main() -> int:
              "(macOS `open`, Linux `xdg-open`, Windows default). Best-effort.",
     )
     args = parser.parse_args(argv)
+    try:
+        _validate_project_args(args)
+    except GatewayError as e:
+        parser.error(str(e))
     # '' / 'auto' / 'default' mean "backend decides" for the image-tool string
     # knobs; collapse them to None once so every consumer agrees.
     for _attr in ("image_model", "quality", "background", "action"):

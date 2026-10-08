@@ -4409,5 +4409,516 @@ class RecoverCommand(unittest.TestCase):
         self.assertEqual(self.ab_calls, [("close",)])
 
 
+class WebProjectRouting(unittest.TestCase):
+    """Exact URL targets bypass name creation; required routing never degrades."""
+
+    ID = "g-p-0123456789abcdef0123456789abcdef"
+    URL = "https://chatgpt.com/g/" + ID + "/project"
+
+    def test_project_url_decorations_resolve_to_one_stable_id(self):
+        """Display slugs, localization, and share decorations are not identity."""
+        for suffix in ("", "-image-art", "-画图", "-%E7%94%BB%E5%9B%BE"):
+            for tail in ("/project", "/project/", "/project?source=share#top"):
+                with self.subTest(suffix=suffix, tail=tail):
+                    self.assertEqual(cig._project_url_id(
+                        "https://chatgpt.com/g/" + self.ID + suffix + tail), self.ID)
+        self.assertIsNone(cig._project_url_id("My art project"))
+        self.assertIsNone(cig._project_url_id("Art: concepts"))
+
+    def test_url_like_invalid_targets_are_never_names(self):
+        """Reject malformed, external, GPT, and conversation links before creation."""
+        bad = [self.URL.replace("https:", "http:"),
+               self.URL.replace("chatgpt.com", "example.com"),
+               self.URL.replace("chatgpt.com", "chatgpt.com.evil.example"),
+               self.URL.replace("chatgpt.com", "user@chatgpt.com"),
+               self.URL.replace("chatgpt.com", "chatgpt.com:443"),
+               self.URL.replace(self.ID, self.ID + "0"),
+               self.URL.replace(self.ID, "g-p-short"),
+               self.URL.replace("/project", "/c/01234567-89ab-cdef"),
+               self.URL.replace("/project", "/project/extra"),
+               self.URL.replace("https://", "//"),
+               self.URL.replace("https://", "chatgpt.com/https://"),
+               "https://chatgpt.com/g/g-example/project"]
+        for target in bad:
+            with self.subTest(target=target), \
+                 unittest.mock.patch.object(cig, "_ab_eval") as page, \
+                 unittest.mock.patch.object(cig, "_ab") as ab:
+                with self.assertRaisesRegex(cig.GatewayError, "Project URL"):
+                    cig._enter_project("ab", "s", target, lambda: 90, lambda _: None)
+                page.assert_not_called()
+                ab.assert_not_called()
+
+    def test_url_opens_canonical_target_without_sidebar_or_create(self):
+        """An existing URL opens directly, including projects not in the sidebar."""
+        with unittest.mock.patch.object(cig, "_ab_eval") as page, \
+             unittest.mock.patch.object(cig, "_ab") as ab, \
+             unittest.mock.patch.object(cig, "_wait_composer", return_value=True):
+            self.assertEqual(cig._enter_project("ab", "s",
+                self.URL.replace("/project", "-画图/project?share=1"),
+                lambda: 90, lambda _: None), self.ID)
+        page.assert_not_called()
+        self.assertEqual(ab.call_args.args, ("ab", "open", self.URL))
+
+    def test_name_lookup_and_create_behavior_remains_available(self):
+        """Names keep the authenticated lookup/create flow and return its ID."""
+        for created in (False, True):
+            messages = []
+            with self.subTest(created=created), \
+                 unittest.mock.patch.object(cig, "_ab_eval",
+                     return_value={"ok": True, "id": self.ID, "created": created}) as page, \
+                 unittest.mock.patch.object(cig, "_ab"), \
+                 unittest.mock.patch.object(cig, "_wait_composer", return_value=True):
+                self.assertEqual(cig._enter_project("ab", "s", "Art",
+                    lambda: 90, messages.append), self.ID)
+                self.assertIn(json.dumps("Art"), page.call_args.args[1])
+                self.assertEqual("(created)" in messages[0], created)
+
+    def test_optional_failure_restores_plain_chat_but_required_failure_stops(self):
+        """Only legacy best-effort routing warns and opens a plain chat."""
+        for required in (False, True):
+            messages = []
+            with self.subTest(required=required), \
+                 unittest.mock.patch.object(cig, "_ab") as ab, \
+                 unittest.mock.patch.object(cig, "_wait_composer", return_value=False):
+                if required:
+                    with self.assertRaisesRegex(cig.GatewayError, "required"):
+                        cig._enter_project("ab", "s", self.URL,
+                            lambda: 90, messages.append, require=True)
+                    self.assertEqual(ab.call_count, 1)
+                else:
+                    self.assertIsNone(cig._enter_project("ab", "s", self.URL,
+                        lambda: 90, messages.append))
+                    self.assertEqual(ab.call_args.args, ("ab", "open", cig.WEB_NEW_CHAT_URL))
+                    self.assertIn("using a plain chat", messages[-1])
+
+    def test_required_entry_verifies_identity_after_composer_appears(self):
+        """A visible composer on a redirected page is not a resolved Project."""
+        for actual in (None, self.ID[:-1] + "0"):
+            with self.subTest(actual=actual), \
+                 unittest.mock.patch.object(cig, "_ab_eval", return_value=actual), \
+                 unittest.mock.patch.object(cig, "_ab") as ab, \
+                 unittest.mock.patch.object(cig, "_wait_composer", return_value=True):
+                with self.assertRaisesRegex(cig.GatewayError, "required"):
+                    cig._enter_project("ab", "s", self.URL,
+                        lambda: 90, lambda _: None, require=True)
+                self.assertEqual(ab.call_count, 1)
+
+    def test_required_resolution_open_and_composer_errors_never_restore_plain_chat(self):
+        """Every entry failure propagates before generation or plain-chat recovery."""
+        cases = [("Art", {"ok": False, "error": "HTTP 403"}, None, True),
+                 ("Art", {"ok": True, "id": "not-a-project"}, None, True),
+                 (self.URL, self.ID, cig.GatewayError("open failed"), True),
+                 (self.URL, self.ID, None, False),
+                 (self.URL, cig.GatewayError("route unreadable"), None, True)]
+        for target, page, open_error, composer in cases:
+            with self.subTest(target=target, page=page, open_error=open_error), \
+                 unittest.mock.patch.object(cig, "_ab_eval",
+                     **({"side_effect": page} if isinstance(page, Exception) else {"return_value": page})), \
+                 unittest.mock.patch.object(cig, "_ab", side_effect=open_error) as ab, \
+                 unittest.mock.patch.object(cig, "_wait_composer", return_value=composer):
+                with self.assertRaisesRegex(cig.GatewayError, "required"):
+                    cig._enter_project("ab", "s", target, lambda: 90, lambda _: None, require=True)
+            self.assertNotIn(cig.WEB_NEW_CHAT_URL, [c.args[2] for c in ab.call_args_list])
+
+
+class RequiredProjectSubmission(unittest.TestCase):
+    """Preserve drafts and never replay an uncertain guarded native Send."""
+
+    def _run(self, project=None, arm=None, guarded=None, click_error=False, states=None):
+        """Simulate only transport boundaries; execute the real submit control flow."""
+        self.calls, self.evals = [], []
+        project_id = WebProjectRouting.ID
+        states = states or [_composer_state(), _composer_state("prompt"),
+                            _composer_state(user_turns=1)]
+
+        def page(ab, js, **kw):
+            """Return route and guard receipts while recording evaluated scripts."""
+            self.evals.append(js)
+            if js == cig._JS_PROJECT_ID:
+                return project_id if project is None else project
+            result = guarded if js.startswith("JSON.stringify(window[") else arm
+            if isinstance(result, Exception):
+                raise result
+            return result if result is not None else {"ok": True}
+
+        def command(*args, **kw):
+            """Record native transport calls and optionally lose the click response."""
+            self.calls.append((args, kw))
+            if click_error and args[1] == "click":
+                raise cig.GatewayError("native click outcome unknown")
+
+        state_iter = iter(states)
+        with unittest.mock.patch.object(cig, "_ab_eval", side_effect=page), \
+             unittest.mock.patch.object(cig, "_web_composer_state",
+                 side_effect=lambda *a: next(state_iter, states[-1])), \
+             unittest.mock.patch.object(cig, "_ab", side_effect=command), \
+             unittest.mock.patch.object(cig.time, "sleep"):
+            cig._submit_web_prompt("ab", "s", "prompt", 0, lambda: 90, lambda _: None,
+                                   required_project_id=project_id)
+
+    def test_wrong_project_stops_before_paste(self):
+        """A mismatched Project never receives the prompt or a Send click."""
+        with self.assertRaisesRegex(cig.GatewayError, "required"):
+            self._run(project="g-p-ffffffffffffffffffffffffffffffff")
+        self.assertEqual(self.calls, [])
+
+    def test_guard_refusal_or_unreadable_arm_prevents_native_click_and_preserves_draft(self):
+        """Failed guard setup retains the pasted draft and never clicks Send."""
+        for result in ({"ok": False, "error": "Project route changed"},
+                       {}, cig.GatewayError("guard setup outcome unknown")):
+            with self.subTest(result=result), self.assertRaisesRegex(cig.GatewayError, "Draft retained"):
+                self._run(arm=result)
+            self.assertEqual([a[1] for a, _ in self.calls], ["fill"])
+            self.assertTrue(any(js.startswith("JSON.stringify(window[") for js in self.evals))
+
+    def test_click_time_guard_refusal_stops_without_draft_cleanup_or_replay(self):
+        """A blocked native event leaves the current draft and is never retried."""
+        with self.assertRaisesRegex(cig.GatewayError, "Draft retained"):
+            self._run(guarded={"ok": False, "error": "Project route changed"})
+        self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
+
+    def test_readiness_failure_preserves_current_composer(self):
+        """Changed text can belong to another context; do not erase it."""
+        with self.assertRaisesRegex(cig.GatewayError, "text differs"):
+            self._run(states=[_composer_state(), _composer_state("someone else's draft")])
+        self.assertEqual([a[1] for a, _ in self.calls], ["fill"])
+
+    def test_correct_project_has_one_native_send_to_the_marked_button(self):
+        """One native click targets only the button carrying this guard token."""
+        self._run()
+        self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
+        selector = self.calls[-1][0][2]
+        self.assertRegex(selector, r'^button\[data-image-use-project-send="imageUseProjectSend_[0-9a-f]{32}"\]$')
+        arm_js = next(js for js in self.evals if js.startswith(cig._JS_ARM_PROJECT_SEND.split("%s")[0]))
+        self.assertIn(selector.split('"')[1], arm_js)
+
+    def test_uncertain_native_click_observes_receipt_without_replay(self):
+        """A lost click response can be confirmed without a second Send."""
+        self._run(click_error=True)
+        self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
+
+    def test_uncertain_send_without_receipt_stops_without_replay_or_draft_cleanup(self):
+        """Missing receipts cannot justify resending or clearing the current draft."""
+        for outcome in ({}, cig.GatewayError("guard receipt unknown")):
+            with self.subTest(outcome=outcome), \
+                 self.assertRaisesRegex(cig.GatewayError, "Send was not repeated"):
+                self._run(guarded=outcome, states=[_composer_state(), _composer_state("prompt")])
+            self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
+
+    def test_existing_draft_is_untouched_in_required_mode(self):
+        """An existing draft prevents both prompt paste and Send."""
+        with self.assertRaisesRegex(cig.GatewayError, "not empty"):
+            self._run(states=[_composer_state("existing draft")])
+        self.assertEqual(self.calls, [])
+
+    def test_long_prompt_guard_uses_stdin_instead_of_browser_command_arguments(self):
+        """Embedding exact text in the guard must not reintroduce argv size limits."""
+        prompt = "first\n\nUnicode 猫 — $() `text`\n" * 6000
+        calls = []
+        def ab(*args, **kw):
+            """Emulate encoded browser responses and record long-script stdin use."""
+            calls.append((args, kw))
+            if args[1] == "click":
+                return ""
+            result = {"ok": True} if (args[2] == "--stdin" or
+                args[2].startswith("JSON.stringify(window[")) else WebProjectRouting.ID
+            return json.dumps(json.dumps(result))
+        with unittest.mock.patch.object(cig, "_ab", side_effect=ab), \
+             unittest.mock.patch.object(cig, "_web_composer_state", side_effect=[
+                 _composer_state(), _composer_state(prompt), _composer_state(user_turns=1)]):
+            cig._submit_web_prompt("ab", "s", prompt, 0, lambda: 90, lambda _: None,
+                                   required_project_id=WebProjectRouting.ID)
+        self.assertEqual([a[1] for a, _ in calls], ["eval", "fill", "eval", "click", "eval", "eval"])
+        self.assertEqual(calls[2][0], ("ab", "eval", "--stdin"))
+        self.assertIn(json.dumps(prompt), calls[2][1]["input_text"])
+
+
+@unittest.skipUnless(cig.shutil.which("node"), "Node is needed only to execute page-JS fixtures")
+class RequiredProjectPageJS(unittest.TestCase):
+    """Execute the real capture guard, including changes between arm and native click."""
+
+    def test_native_click_is_guarded_at_the_event_and_cleanup_is_bounded(self):
+        """Wrong routes/state block the app handler; expiry removes only our marker."""
+        project_id, token = WebProjectRouting.ID, "imageUseProjectSend_fixture"
+        script = cig._JS_ARM_PROJECT_SEND % (
+            json.dumps(project_id), json.dumps(token), cig._JS_PROJECT_ID,
+            cig._JS_WEB_COMPOSER_STATE % cig._js_composer_selectors(),
+            json.dumps("prompt"), 0, 0,
+            json.dumps(cig.WEB_COMPOSER_SEL), json.dumps(cig.WEB_SEND_SEL))
+        path = "/g/" + project_id + "/project"
+        cases = [
+            (path, {}, 1),
+            ("/g/" + project_id + "-画图/c/12345678-90ab", {}, 1),
+            ("/g/" + project_id + "-%E7%94%BB%E5%9B%BE/project/", {}, 1),
+            ("/", {}, 0), ("/c/12345678-90ab", {}, 0),
+            ("/g/" + project_id + "0/project", {}, 0),
+            ("/g/g-p-ffffffffffffffffffffffffffffffff/project", {}, 0),
+            (path, {"origin": "https://example.com"}, 0),
+            (path, {"text": "changed"}, 0), (path, {"attachments": 1}, 0),
+            (path, {"turns": 1}, 0), (path, {"disabled": True}, 0),
+            (path, {"busy": True}, 0), (path, {"dialog": True}, 0),
+            (path, {"composer": False}, 0),
+            (path, {"latePath": "/"}, 0),
+            (path, {"latePath": "/g/g-p-ffffffffffffffffffffffffffffffff/project"}, 0),
+            (path, {"lateText": "another draft"}, 0),
+            (path, {"lateAttachments": 1}, 0), (path, {"lateTurns": 1}, 0),
+            (path, {"lateDialog": True}, 0), (path, {"expired": True}, 0),
+            (path, {"newDocument": True}, 0),
+        ]
+        harness = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const results = input.cases.map(([pathname, cfg]) => {
+  let clicks = 0, listener = null, expiry = null;
+  const attributes = {'data-owner': 'preserve'};
+  const window = {
+    addEventListener: (name, fn) => {listener = fn;},
+    removeEventListener: () => {listener = null;},
+  };
+  const setTimeout = fn => {expiry = fn; return 1;};
+  const clearTimeout = () => {expiry = null;};
+  const send = {
+    disabled: !!cfg.disabled,
+    setAttribute: (key, value) => {attributes[key] = value;},
+    removeAttribute: key => {delete attributes[key];},
+    getAttribute: key => attributes[key] || null,
+    closest: () => send,
+    click: () => {
+      let blocked = false;
+      const event = {target: send, preventDefault: () => {blocked = true;},
+        stopImmediatePropagation: () => {blocked = true;}};
+      if (listener) listener(event);
+      if (!blocked) clicks++;  // stand-in for the app's Send handler
+    },
+  };
+  const form = {
+    querySelector: sel => sel === input.send ? send : (cfg.busy ? {} : null),
+    querySelectorAll: () => Array.from({length: cfg.attachments || 0},
+      () => ({src: 'https://chatgpt.com/backend-api/estuary/content?id=fixture'})),
+  };
+  const composer = {value: cfg.text || 'prompt', childNodes: [], closest: () => form};
+  const document = {
+    querySelector: sel => sel === input.composer ? (cfg.composer === false ? null : composer)
+      : (cfg.dialog ? {} : null),
+    querySelectorAll: () => Array.from({length: cfg.turns || 0}, () => ({
+      parentElement: {closest: () => null}, closest: () => null,
+    })),
+  };
+  const location = {pathname, origin: cfg.origin || 'https://chatgpt.com'};
+  const armed = JSON.parse(eval(input.script));
+  if (armed.ok) {
+    if (cfg.latePath) location.pathname = cfg.latePath;
+    if (cfg.lateText) composer.value = cfg.lateText;
+    if (cfg.lateAttachments) cfg.attachments = cfg.lateAttachments;
+    if (cfg.lateTurns) cfg.turns = cfg.lateTurns;
+    if (cfg.lateDialog) cfg.dialog = true;
+    if (cfg.expired) expiry();
+    if (cfg.newDocument) { // a new document cannot carry the armed marker
+      delete attributes['data-image-use-project-send'];
+      delete window[input.token]; listener = null;
+    }
+    if (attributes['data-image-use-project-send'] === input.token) send.click();
+  }
+  const receipt = window[input.token] ? window[input.token].finish() : null;
+  return {clicks, marker: attributes['data-image-use-project-send'] || null,
+          listener: !!listener, owner: attributes['data-owner'], text: composer.value};
+});
+process.stdout.write(JSON.stringify(results));
+"""
+        proc = subprocess.run([cig.shutil.which("node"), "-e", harness], text=True,
+            input=json.dumps({"script": script, "cases": cases, "token": token,
+                              "composer": cig.WEB_COMPOSER_SEL, "send": cig.WEB_SEND_SEL}),
+            capture_output=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for case, result in zip(cases, json.loads(proc.stdout)):
+            with self.subTest(case=case):
+                cfg = case[1]
+                self.assertEqual(result, {"clicks": case[2], "marker": None, "listener": False,
+                    "owner": "preserve", "text": cfg.get("lateText", cfg.get("text", "prompt"))})
+
+
+class RequiredProjectIntegration(unittest.TestCase):
+    """Carry resolved identity through run_web, with retention independently controlled."""
+
+    def test_run_web_passes_required_identity_and_respects_retention_flags(self):
+        """Resolved identity reaches generation while retention controls deletion."""
+        from contextlib import ExitStack
+        for required, keep, keep_tab in ((True, False, False), (True, True, False),
+                                        (True, False, True), (False, False, False)):
+            args = argparse.Namespace(backend="web", project=WebProjectRouting.URL,
+                require_project=required, keep_conversation=keep, keep_tab=keep_tab,
+                profile="relay", session="fixture", timeout=90, gen_prompt="image",
+                size="auto", web_model="")
+            with self.subTest(required=required, keep=keep, keep_tab=keep_tab), ExitStack() as stack:
+                for name, result in (("_find_agent_browser", "ab"), ("_relay_connected", True),
+                                     ("_wait_composer", True), ("_ref_counts", (0, 0, 0))):
+                    stack.enter_context(unittest.mock.patch.object(cig, name, return_value=result))
+                for name in ("_warn_if_chrome_use_old", "_ensure_web_model", "_ab"):
+                    stack.enter_context(unittest.mock.patch.object(cig, name))
+                entry = stack.enter_context(unittest.mock.patch.object(cig, "_enter_project",
+                                             return_value=WebProjectRouting.ID))
+                generate = stack.enter_context(unittest.mock.patch.object(cig, "_generate_in_browser",
+                                                return_value=(b"image", {})))
+                delete = stack.enter_context(unittest.mock.patch.object(cig, "_delete_conversation"))
+                cig.run_web(args, False, 0)
+                self.assertEqual(entry.call_args.kwargs["require"], required)
+                self.assertEqual(generate.call_args.kwargs["required_project_id"],
+                                 WebProjectRouting.ID if required else None)
+                self.assertEqual(delete.call_count, int(not keep and not keep_tab))
+
+    def test_required_route_failure_stops_before_reference_resolution_or_upload(self):
+        """Route rejection prevents reference work and prompt submission."""
+        with unittest.mock.patch.object(cig, "_ab_eval", return_value=None), \
+             unittest.mock.patch.object(cig, "_resolve_ref_path") as resolve, \
+             unittest.mock.patch.object(cig, "_upload_references") as upload, \
+             unittest.mock.patch.object(cig, "_submit_web_prompt") as submit:
+            with self.assertRaisesRegex(cig.GatewayError, "required"):
+                cig._generate_in_browser("ab", "s", "prompt", argparse.Namespace(),
+                    90, lambda: 90, lambda _: None, refs=["fixture.png"],
+                    required_project_id=WebProjectRouting.ID)
+        resolve.assert_not_called()
+        upload.assert_not_called()
+        submit.assert_not_called()
+
+    def test_cli_env_flag_and_retention_are_independent(self):
+        """The real parser consumes env/flags before styles or backend work."""
+        parse_args = argparse.ArgumentParser.parse_args
+        for env, flags, expected, keep in (
+            ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, [], True, False),
+            ({"CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, [], True, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "0", "CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, [], False, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, ["--no-require-project"], False, False),
+            ({"CHATGPT_IMAGEGEN_REQUIRE_PROJECT": "1"}, ["--no-require-project"], False, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "0"}, ["--require-project"], True, False),
+            ({}, ["--require-project", "--no-require-project"], False, False),
+            ({}, ["--no-require-project", "--require-project"], True, False),
+            ({"IMAGE_USE_REQUIRE_PROJECT": "1"}, ["--no-require-project", "--keep-conversation"], False, True),
+            ({}, ["--require-project", "--keep-conversation"], True, True),
+        ):
+            args_seen = []
+            def record_args(parser, argv):
+                """Record real parser output before any styles or backend work."""
+                args = parse_args(parser, argv)
+                args_seen.append(args)
+                return args
+            with self.subTest(env=env, flags=flags), \
+                 unittest.mock.patch.dict(os.environ, env, clear=True), \
+                 unittest.mock.patch.object(sys, "argv", ["image-use", "prompt", *flags]), \
+                 unittest.mock.patch.object(cig, "_should_check_for_update", return_value=False), \
+                 unittest.mock.patch.object(argparse.ArgumentParser, "parse_args",
+                     autospec=True, side_effect=record_args), \
+                 unittest.mock.patch.object(cig, "_load_styles",
+                     side_effect=RuntimeError("parser checkpoint")):
+                with self.assertRaisesRegex(RuntimeError, "parser checkpoint"):
+                    cig.main()
+            self.assertEqual(args_seen[0].require_project, expected)
+            self.assertEqual(args_seen[0].keep_conversation, keep)
+
+    def test_cli_opt_out_allows_plain_chat_or_non_web_backend_without_changing_env(self):
+        """A per-run opt-out passes validation while the exported default stays on."""
+        parse_args = argparse.ArgumentParser.parse_args
+        for env_name in ("IMAGE_USE_REQUIRE_PROJECT", "CHATGPT_IMAGEGEN_REQUIRE_PROJECT"):
+            for backend, project in (("web", ""), ("auto", ""), ("codex", "Art"),
+                                     ("gemini", "Art"), ("agy", "Art")):
+                args_seen = []
+                def record_args(parser, argv):
+                    """Observe the actual CLI parser without bypassing validation."""
+                    args = parse_args(parser, argv)
+                    args_seen.append(args)
+                    return args
+                with self.subTest(env=env_name, backend=backend, project=project), \
+                     unittest.mock.patch.dict(os.environ, {env_name: "1"}, clear=True), \
+                     unittest.mock.patch.object(sys, "argv", ["image-use", "prompt",
+                         "--no-require-project", "--backend", backend, "--project", project]), \
+                     unittest.mock.patch.object(cig, "_should_check_for_update", return_value=False), \
+                     unittest.mock.patch.object(argparse.ArgumentParser, "parse_args",
+                         autospec=True, side_effect=record_args), \
+                     unittest.mock.patch.object(cig, "_load_styles",
+                         side_effect=RuntimeError("parser checkpoint")), \
+                     unittest.mock.patch.object(cig, "_dispatch") as dispatch:
+                    with self.assertRaisesRegex(RuntimeError, "parser checkpoint"):
+                        cig.main()
+                    self.assertEqual(os.environ[env_name], "1")
+                    self.assertFalse(args_seen[0].require_project)
+                    self.assertEqual(args_seen[0].backend, backend)
+                    self.assertEqual(args_seen[0].project, project)
+                    dispatch.assert_not_called()
+
+    def test_cli_invalid_route_stops_before_styles_or_backend(self):
+        """Invalid required targets and backends fail before downstream work."""
+        for flags in (["--require-project", "--project", ""],
+                      ["--require-project", "--backend", "codex"],
+                      ["--project", "https://example.com/project"]):
+            with self.subTest(flags=flags), \
+                 unittest.mock.patch.dict(os.environ, {}, clear=True), \
+                 unittest.mock.patch.object(sys, "argv", ["image-use", "prompt", *flags]), \
+                 unittest.mock.patch.object(cig, "_should_check_for_update", return_value=False), \
+                 unittest.mock.patch.object(cig, "_load_styles") as styles, \
+                 unittest.mock.patch.object(cig, "_dispatch") as dispatch, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cig.main()
+                self.assertEqual(error.exception.code, 2)
+            styles.assert_not_called()
+            dispatch.assert_not_called()
+
+
+class RequiredProjectDispatch(unittest.TestCase):
+    """The real dispatch boundary rejects incompatible backends and fallbacks."""
+
+    def setUp(self):
+        """Provide a valid required-Project request for dispatch boundary tests."""
+        self.args = argparse.Namespace(backend="auto", project="Art", require_project=True,
+                                      ref=None, resolved_refs=None)
+
+    @contextmanager
+    def _backends(self, failure=None):
+        """Record every backend/token boundary without opening a browser or lock."""
+        from contextlib import ExitStack, nullcontext
+        with ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(cig, "_codex_only_options", return_value=[]))
+            for lock in ("_chatgpt_web_turn", "_concurrency_slot"):
+                stack.enter_context(unittest.mock.patch.object(cig, lock, side_effect=lambda *a: nullcontext()))
+            calls = {name: stack.enter_context(unittest.mock.patch.object(cig, name))
+                     for name in ("run_web", "run_codex", "run_gemini", "run_agy", "_codex_token_present")}
+            calls["run_web"].side_effect = failure
+            calls["run_web"].return_value = (b"image", {})
+            yield calls
+
+    def test_required_unavailable_web_never_reads_codex_token_or_falls_back(self):
+        """Unavailable web stops required mode before Codex credentials or calls."""
+        with self._backends(cig.WebUnavailable("relay offline")) as calls:
+            with self.assertRaisesRegex(SystemExit, "required"):
+                cig._dispatch(self.args, False, 300, 0)
+        calls["run_web"].assert_called_once()
+        calls["run_codex"].assert_not_called()
+        calls["_codex_token_present"].assert_not_called()
+
+    def test_required_non_web_backends_and_empty_target_stop_before_work(self):
+        """Reject explicit incompatible routes, even when their clients are ready."""
+        for backend, project in (("codex", "Art"), ("gemini", "Art"),
+                                 ("agy", "Art"), ("auto", ""), ("web", "  ")):
+            with self.subTest(backend=backend, project=project), self._backends() as calls:
+                self.args.backend, self.args.project = backend, project
+                with self.assertRaises(SystemExit):
+                    cig._dispatch(self.args, False, 300, 0)
+                for call in calls.values():
+                    call.assert_not_called()
+
+    def test_required_generation_error_does_not_suggest_codex(self):
+        """Required-mode failures never recommend switching to Codex."""
+        with self._backends(cig.GatewayError("required Project changed")) as calls:
+            with self.assertRaises(SystemExit) as error:
+                cig._dispatch(self.args, False, 300, 0)
+        self.assertNotIn("rerun with --backend codex", str(error.exception))
+        calls["run_codex"].assert_not_called()
+
+    def test_optional_auto_fallback_is_unchanged(self):
+        """Existing users retain fallback when they have not required a Project."""
+        self.args.require_project = False
+        with self._backends(cig.WebUnavailable("relay offline")) as calls:
+            calls["_codex_token_present"].return_value = True
+            cig._dispatch(self.args, False, 300, 0)
+        calls["run_codex"].assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

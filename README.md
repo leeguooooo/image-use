@@ -111,13 +111,44 @@ needs [libwebp](https://developers.google.com/speed/webp/download) (`img2webp`).
 
 Full options: `image-use --help`. → **[Generate images](https://drawstyle.leeguoo.com/en/docs/generate)** · **[Styles](https://drawstyle.leeguoo.com/en/docs/styles)**
 
+To organize web runs, `--project` accepts an exact **name** (found or created;
+default `imagegen`) or an existing **Project landing URL** such as
+`https://chatgpt.com/g/g-p-<32-hex-id>/project`. URL targets open directly by ID,
+without listing or creating projects; localized display slugs, query strings,
+and fragments are accepted and discarded when opening the canonical URL.
+Malformed URL targets are rejected. `--project ""` uses a plain chat.
+
+Project routing is best-effort by default: an unavailable project warns and
+continues in a plain chat. Add `--require-project` (or `IMAGE_USE_REQUIRE_PROJECT=1`)
+when that fallback would be unwanted. It requires a non-empty target and
+`--backend web` or `auto`, verifies Project identity after opening and again in
+a capture guard on the native Send click, and disables Codex fallback even when
+the browser is unavailable. `IMAGE_USE_PROJECT` can supply either a name or URL.
+Use `--no-require-project` to override the environment default for one run,
+restoring best-effort routing and ordinary backend/fallback rules without
+changing the exported variable.
+
+Required-mode failures before Send retain the current draft for inspection.
+Inspect it in ChatGPT and manually clear the composer before the next run;
+ChatGPT can restore unsent drafts in new chats.
+
+```bash
+image-use "a watercolor cat" --project "Art" --require-project --keep-conversation
+# To target an existing project exactly, set PROJECT_URL to its browser URL:
+image-use "a watercolor cat" --project "$PROJECT_URL" --require-project --keep-conversation
+```
+
+Routing and retention are independent: **the conversation is deleted by default**,
+including with `--require-project`. Use `--keep-conversation` (or
+`IMAGE_USE_KEEP_CONVERSATION=1`) to retain it; `--keep-tab` also retains it.
+
 The ChatGPT browser backend pastes multiline prompts, checks the exact editor
 text, and waits for every reference upload to finish before clicking Send once.
 Incomplete uploads or altered text stop the run. If a send cannot be confirmed,
 it reports the uncertainty without sending again. Start with an empty composer;
 an existing draft is preserved. A run that stops before sending clears the text
-it pasted; if a run still reports a non-empty composer, clear the box at
-chatgpt.com — ChatGPT restores unsent drafts in new chats.
+it pasted, except in required Project mode: it preserves the current draft for
+inspection because the route or draft ownership may have changed.
 
 After sending, the web backend waits up to `--timeout` for a fresh image confirmed
 in two consecutive page reads. Assistant text or a missing Stop control does not

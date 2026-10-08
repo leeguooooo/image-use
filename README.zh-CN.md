@@ -99,11 +99,38 @@ image-use "产品主图" --backend codex --image-model gpt-image-2.5-sunburst --
 
 完整参数:`image-use --help`。→ **[生成图片](https://drawstyle.leeguoo.com/zh/docs/generate)** · **[风格系统](https://drawstyle.leeguoo.com/zh/docs/styles)**
 
+web 后端的 `--project` 可以传精确**名称**(找到就复用,没有就创建;默认 `imagegen`),
+也可以传已有 **Project 首页链接**,形如
+`https://chatgpt.com/g/g-p-<32-hex-id>/project`。链接按完整 ID 直接打开,不依赖侧栏列表,
+也不创建 Project;支持中文等显示名 slug、query 和 fragment,打开时去掉这些装饰。
+格式错误的链接会直接报错。`--project ""` 则使用普通 chat。
+
+默认仍是 best-effort:Project 不可用时会警告并继续使用普通 chat。如果必须在目标
+Project 中提交,加 `--require-project`(或 `IMAGE_USE_REQUIRE_PROJECT=1`)。
+它要求目标非空,backend 为 `web` 或 `auto`,进入后核对 Project 身份,并在原生
+发送点击事件的捕获阶段再次校验身份和输入状态;浏览器不可用时也禁止回退 Codex。
+`IMAGE_USE_PROJECT` 同样可以设置名称或链接。
+用 `--no-require-project` 可以只在本次运行覆盖环境变量的默认值,恢复 best-effort
+路由和普通 backend/fallback 规则,不需要修改已 export 的变量。
+
+required 模式在发送前失败时会保留当前草稿供检查。请先在 ChatGPT 中检查草稿,
+再手动清空输入框后运行下一次;ChatGPT 可能会在新对话里恢复未发送的草稿。
+
+```bash
+image-use "一只水彩猫" --project "Art" --require-project --keep-conversation
+# 精确指定已有 Project 时,先把浏览器里的首页链接赋给 PROJECT_URL:
+image-use "一只水彩猫" --project "$PROJECT_URL" --require-project --keep-conversation
+```
+
+路由与保留对话是独立选项:**默认仍会删除对话**,即使加了 `--require-project`。
+要让对话留在 Project 中,加 `--keep-conversation`(或 `IMAGE_USE_KEEP_CONVERSATION=1`);
+`--keep-tab` 也会保留对话。
+
 ChatGPT 浏览器后端会粘贴多行提示词,核对编辑器中的完整文本,等待所有参考图上传
 完成后只点击一次发送。上传不完整或文本发生变化时会停止;无法确认发送结果时会
 报告问题,不会重复发送。运行前请确保输入框为空,已有草稿会被保留。未发送就中止的运行
-会清掉自己粘贴的文本;如果仍提示输入框非空,请到 chatgpt.com 手动清空——ChatGPT 会在
-新对话里恢复未发送的草稿。
+会清掉自己粘贴的文本;required Project 模式会保留当前草稿供检查,避免在路由或草稿
+归属变化后误清其他内容。
 
 发送后,web 后端会在 `--timeout` 内等待新图片,要求相邻两次页面读取确认到同一张图。
 assistant 正文出现或 Stop 控件缺失,都不能证明图片任务已经结束。已检测到的限流
