@@ -22,7 +22,7 @@ NOREPLY_RE = re.compile(r"(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com"
 
 
 def md(text: str) -> str:
-    """Keep `<会话链接>`-style placeholders visible: GitHub drops unknown tags."""
+    """Keep `<conversation-url>`-style placeholders visible: GitHub drops unknown tags."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -68,9 +68,9 @@ def notes(version: str, target: str = "HEAD", previous: str | None = None) -> st
     if summary:
         out += [summary, ""]
     if changes:
-        out += ["## 改动", "", *changes, ""]
+        out += ["## Changes", "", *changes, ""]
     if thanks:
-        out += ["感谢 " + "、".join(f"@{t}" for t in thanks) + " 的贡献。", ""]
+        out += ["Thanks " + ", ".join(f"@{t}" for t in thanks) + " for contributing.", ""]
     out.append(f"**Full Changelog**: https://github.com/{REPO}/compare/{previous}...v{version}")
     return "\n".join(out) + "\n"
 
