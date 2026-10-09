@@ -23,3 +23,5 @@ jobs:
         run: python -m py_compile image-use chatgpt-imagegen
       - name: Run unit tests
         run: python -m unittest test_image_use -v
+      - name: Test install.sh
+        run: sh tests/install.test.sh

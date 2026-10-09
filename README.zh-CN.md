@@ -31,7 +31,13 @@ npx skills add leeguooooo/image-use -g
 
 然后直接说:*"画一张 …"*。
 
-**独立命令行**——不用 `pip`、不用虚拟环境:
+**独立命令行**——不用 `pip`、不用虚拟环境、不用 sudo。把仓库克隆到 `~/.agents/use-family/image-use`，把 `image-use` 链接到 `~/.local/bin`，并给 Claude Code / Codex 链接 skill;重新运行即可更新:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/image-use/main/install.sh | sh
+```
+
+或者手动:
 
 ```bash
 git clone https://github.com/leeguooooo/image-use

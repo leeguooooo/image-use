@@ -31,7 +31,13 @@ npx skills add leeguooooo/image-use -g
 
 Then just ask: *"画一张 …"* / *"generate a hero banner for the README"*.
 
-**Standalone CLI** — no `pip`, no virtualenv:
+**Standalone CLI** — no `pip`, no virtualenv, no sudo. Keeps a git checkout under `~/.agents/use-family/image-use`, links `image-use` into `~/.local/bin` and the skill for Claude Code / Codex; re-run to update:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/image-use/main/install.sh | sh
+```
+
+Or by hand:
 
 ```bash
 git clone https://github.com/leeguooooo/image-use
