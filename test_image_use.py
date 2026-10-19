@@ -27,6 +27,7 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+from tests.test_web_data_attachments import DataAttachmentState
 from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
