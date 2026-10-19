@@ -6388,14 +6388,18 @@ def _git_toplevel(path: Path) -> Path | None:
 
 
 def _git_checkout_root(path: Path) -> Path | None:
-    """``path`` when it is itself the root of a git clone of this repo.
+    """Checkout root for a root install or the exact bundled Skill directory.
 
-    Only a clone whose root IS the folder counts: a copied skill folder that
-    happens to sit inside some other repo (a dotfiles repo holding
-    ~/.claude, say) must never get that repo pulled."""
+    Also accepts the exact bundled skills/image-use directory in a verified
+    image-use clone. A copied skill inside another repository must never
+    cause that surrounding repository to be pulled."""
     top = _git_toplevel(path)
     try:
-        return top if top is not None and top == path.resolve() else None
+        resolved = path.resolve()
+        if top is not None and (top == resolved or (
+                resolved == top / "skills" / SKILL_NAME and _git_is_this_repo(top))):
+            return top
+        return None
     except OSError:
         return None
 
@@ -6415,6 +6419,11 @@ def _git_is_this_repo(path: Path) -> bool:
 def _is_plugin_path(path: Path) -> bool:
     parts = path.parts
     return any(a == ".claude" and b == "plugins" for a, b in zip(parts, parts[1:]))
+
+
+def _is_codex_plugin_path(path: Path) -> bool:
+    return any(parts == (".codex", "plugins", "cache")
+               for parts in zip(path.parts, path.parts[1:], path.parts[2:]))
 
 
 def _plugin_installs() -> list[dict]:
@@ -6473,10 +6482,12 @@ def _find_skill_installs() -> list[dict]:
 
 def _cli_install_route() -> tuple[str, Path]:
     """How this CLI file was installed, from where it lives:
-    `claude-plugin` (the plugin cache), `git` (a clone), `skills` (a skill
-    folder the `skills` manager copied) or `file` (a lone copied script)."""
+    `codex-plugin`/`claude-plugin` (host-managed caches), `git` (this clone),
+    `skills` (a skills-manager copy) or `file` (a lone copied script)."""
     here = Path(__file__).resolve()
     folder = here.parent
+    if _is_codex_plugin_path(here):
+        return "codex-plugin", folder
     if _is_plugin_path(here):
         return "claude-plugin", folder
     # Only a clone of THIS repo: a script sitting at the root of some other
@@ -6529,6 +6540,11 @@ def _run_step(argv: list[str], cwd: str | None = None) -> tuple[int, str]:
 def _install_cli(route: str, where: Path, latest: str) -> int:
     """Step 1 of `upgrade`: install ``latest`` through the route this CLI
     came from. 0 ok, 2 download failed, 1 anything else."""
+    if route == "codex-plugin":
+        print("error: this copy is managed by a Codex plugin; refresh image-use "
+              "through the host plugin manager. This command did not modify its cache.",
+              file=sys.stderr)
+        return 1
     if route == "claude-plugin":
         return 0  # the plugin refresh in step 2 replaces this file
     if route == "git":
@@ -6624,6 +6640,8 @@ def _upgrade_command(argv: list[str]) -> int:
         return 0
 
     route, where = _cli_install_route()
+    if route == "codex-plugin":
+        return _install_cli(route, where, latest)
     rc = 0
     if available:
         for ver, note in _changes_since(_fetch_whatsnew(latest))[:10]:

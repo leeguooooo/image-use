@@ -247,3 +247,5 @@ auth = { command = "/usr/local/bin/get-token", args = ["--name", "relay"], timeo
 支持静态 `http_headers` 和 `env_http_headers`（请求头名 → 环境变量名），
 后者变量不存在时跳过。运行 `image-use doctor --codex-provider current`
 检查配置与令牌是否就绪，输出不显示令牌值。
+
+独立 Skill 位于 [`skills/image-use`](skills/image-use)，其中携带可直接执行的 CLI。根目录 `image-use` 是唯一编辑源；修改后用 `cp image-use skills/image-use/image-use` 同步执行副本，测试和发布检查会拒绝不一致的副本。Codex 管理的缓存副本由宿主更新，CLI 不直接改写缓存。

@@ -277,3 +277,5 @@ The top-level `model` supplies the driver default; `--model` (or
 (header name → environment variable name) are supported; unset header
 variables are skipped. `image-use doctor --codex-provider current` checks
 configuration/token readiness without displaying the token.
+
+The portable agent Skill is in [`skills/image-use`](skills/image-use). The root `image-use` is the canonical CLI source; after editing it, sync the bundled executable with `cp image-use skills/image-use/image-use`. Tests and release checks reject a stale copy. Codex-managed copies defer updates to their host instead of replacing cache files.

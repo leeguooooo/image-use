@@ -3547,9 +3547,44 @@ class _Escape(Exception):
     """Sentinel used to break out of the slot poll loop under test."""
 
 
+class NestedSkillUpgradeRoutes(unittest.TestCase):
+    def test_nested_skill_only_uses_git_for_its_own_repository(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); skill = root / "skills/image-use"; skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("owned")
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(["git", "-C", str(root), "remote", "add", "origin",
+                            "https://github.com/leeguooooo/image-use.git"], check=True)
+            with unittest.mock.patch.object(cig, "__file__", str(skill / "image-use")):
+                self.assertEqual(cig._git_checkout_root(skill), root.resolve())
+                self.assertEqual(cig._cli_install_route(), ("git", skill.resolve()))
+                subprocess.run(["git", "-C", str(root), "remote", "set-url", "origin",
+                                "https://example.invalid/owned-dotfiles.git"], check=True)
+                self.assertIsNone(cig._git_checkout_root(skill))
+                self.assertEqual(cig._cli_install_route(), ("skills", skill.resolve()))
+
+    def test_codex_cache_upgrade_stops_before_any_install_or_skill_refresh(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / ".codex/plugins/cache/owned/image-use/1/skills/image-use/image-use"
+            script.parent.mkdir(parents=True); script.write_text("owned cache sentinel")
+            before = script.read_bytes()
+            with unittest.mock.patch.object(cig, "__file__", str(script)), \
+                 unittest.mock.patch.object(cig, "_fetch_latest_release", return_value="9.9.9"), \
+                 unittest.mock.patch.object(cig, "_find_skill_installs", return_value=[]), \
+                 unittest.mock.patch.object(cig, "_run_step") as run, \
+                 unittest.mock.patch.object(cig, "_replace_script") as replace, \
+                 unittest.mock.patch.object(cig, "_refresh_skill") as refresh, \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(cig._cli_install_route()[0], "codex-plugin")
+                self.assertEqual(cig._upgrade_command([]), 1)
+                self.assertIn("host plugin manager", err.getvalue())
+                run.assert_not_called(); replace.assert_not_called(); refresh.assert_not_called()
+            self.assertEqual(script.read_bytes(), before)
+
+
 class SkillManifestTests(unittest.TestCase):
     def _frontmatter(self):
-        text = (Path(__file__).parent / "SKILL.md").read_text(encoding="utf-8")
+        text = (Path(__file__).parent / "skills/image-use/SKILL.md").read_text(encoding="utf-8")
         return text.split("---", 2)[1]
 
     def test_description_within_pi_limit(self):
@@ -3557,6 +3592,36 @@ class SkillManifestTests(unittest.TestCase):
         self.assertIsNotNone(m)
         desc = " ".join(line.strip() for line in m.group(1).splitlines())
         self.assertLessEqual(len(desc), 1024)
+
+    def test_skill_cli_is_portable_and_matches_the_canonical_script(self):
+        root = Path(__file__).parent
+        bundled = root / "skills/image-use/image-use"
+        self.assertFalse(bundled.is_symlink())
+        self.assertEqual(bundled.read_bytes(), (root / "image-use").read_bytes(),
+                         "Sync the Skill asset: cp image-use skills/image-use/image-use")
+        with tempfile.TemporaryDirectory() as td:
+            copied = Path(td) / "image-use"
+            copied.write_bytes(bundled.read_bytes())
+            result = subprocess.run([sys.executable, str(copied), "--version"],
+                                    env=dict(os.environ, HOME=td), text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "image-use " + cig.__version__)
+
+    def test_release_bump_updates_both_cli_copies_without_running_the_release(self):
+        root = Path(__file__).parent
+        script = (root / "scripts/release.sh").read_text()
+        bump = script.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td); skill = work / "skills/image-use"; skill.mkdir(parents=True)
+            (work / "image-use").write_bytes((root / "image-use").read_bytes())
+            (skill / "SKILL.md").write_bytes((root / "skills/image-use/SKILL.md").read_bytes())
+            result = subprocess.run([sys.executable, "-c", bump], cwd=work,
+                                    env=dict(os.environ, V="9.9.9", NOTE="owned release fixture"),
+                                    text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((skill / "image-use").read_bytes(), (work / "image-use").read_bytes())
+            self.assertIn('__version__ = "9.9.9"', (work / "image-use").read_text())
+            self.assertIn('version: "9.9.9"', (skill / "SKILL.md").read_text())
 
     def test_version_matches_cli(self):
         m = re.search(r'^version: "([^"]+)"', self._frontmatter(), re.M)

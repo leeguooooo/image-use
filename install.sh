@@ -31,7 +31,7 @@ fi
 
 SELF_DIR=""
 case "$0" in */install.sh) SELF_DIR=$(cd "$(dirname "$0")" && pwd) ;; esac
-if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/SKILL.md" ] && [ -f "$SELF_DIR/image-use" ]; then
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/image-use" ] && { [ -f "$SELF_DIR/skills/image-use/SKILL.md" ] || [ -f "$SELF_DIR/SKILL.md" ]; }; then
   ROOT=$SELF_DIR
 else
   ROOT="${IMAGE_USE_HOME:-${USE_FAMILY_DIR:-$HOME/.agents/use-family}/image-use}"
@@ -42,6 +42,12 @@ else
     git clone -q --depth 1 https://github.com/leeguooooo/image-use.git "$ROOT"
   fi
 fi
+
+SKILL_DIR="$ROOT/skills/image-use"
+[ -f "$SKILL_DIR/SKILL.md" ] || SKILL_DIR="$ROOT"
+[ -f "$SKILL_DIR/SKILL.md" ] && [ -f "$SKILL_DIR/image-use" ] || {
+  echo "error: no complete image-use Skill found in $ROOT" >&2; exit 1
+}
 
 link() {  # link <target> <link-path>; never replaces a real file or directory
   if [ -e "$2" ] && [ ! -L "$2" ]; then
@@ -69,7 +75,7 @@ else
   chmod +x "$BIN/image-use"
   echo "wrapped: $BIN/image-use runs $ROOT/image-use with $PY ($("$PY" -V 2>&1))"
 fi
-link "$ROOT" "$HOME/.agents/skills/image-use"
+link "$SKILL_DIR" "$HOME/.agents/skills/image-use"
 # Claude Code plugin installed → it already provides the skill; a second copy would load twice.
 if grep -q '"image-use@' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null; then
   echo "skip: $HOME/.claude/skills/image-use (Claude Code plugin image-use already provides the skill)"

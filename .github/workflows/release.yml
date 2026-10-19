@@ -64,7 +64,9 @@ jobs:
           from pathlib import Path
 
           cli = Path("image-use").read_text(encoding="utf-8")
-          skill = Path("SKILL.md").read_text(encoding="utf-8")
+          skill = Path("skills/image-use/SKILL.md").read_text(encoding="utf-8")
+          if Path("image-use").read_bytes() != Path("skills/image-use/image-use").read_bytes():
+              raise SystemExit("bundled Skill CLI differs from canonical image-use")
           cli_match = re.search(r'^__version__\s*=\s*"([\d.]+)"', cli, re.MULTILINE)
           skill_match = re.search(r'^version:\s*"([\d.]+)"', skill, re.MULTILINE)
           if not cli_match or not skill_match:
