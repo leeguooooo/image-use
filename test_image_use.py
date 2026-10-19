@@ -2409,7 +2409,7 @@ class UploadReferences(unittest.TestCase):
     def test_falls_back_to_next_selector(self):
         """Try the next upload selector when the preferred input is missing."""
         tried, _ = self._run(fail_selectors=("#upload-files",))
-        self.assertEqual(tried, ["#upload-files", "form input[type=file]"])
+        self.assertEqual(tried, ["#upload-files", cig._UPLOAD_SELECTORS[1]])
 
     def test_reraises_last_error_when_all_selectors_fail(self):
         """Expose the final selector error when no upload input can be found."""
@@ -2420,7 +2420,23 @@ class UploadReferences(unittest.TestCase):
     def test_legacy_selector_is_still_last_resort(self):
         """Keep the image-only input selector available for older composers."""
         # Old DOMs exposed only input[accept="image/*"]; keep them working.
-        self.assertIn('input[accept="image/*"]', cig._UPLOAD_SELECTORS)
+        self.assertIn('input[accept="image/*"]:not([capture])', cig._UPLOAD_SELECTORS)
+
+    def test_redesign_media_input_precedes_camera_or_generic_input(self):
+        root = _parse('''<form>
+          <input type="file" accept="image/*" capture="environment">
+          <input type="file" accept="image/*,video/*" multiple>
+          <input type="file" multiple>
+        </form>''')
+        for selector in cig._UPLOAD_SELECTORS:
+            matches = [n for n in root.iter() if _matches(n, selector)]
+            if matches:
+                self.assertEqual(len(matches), 1)
+                self.assertNotIn("capture", matches[0].attrs)
+                self.assertIn("image/", matches[0].attrs.get("accept", ""))
+                break
+        else:
+            self.fail("no media input matched")
 
     def test_waits_for_all_five_server_backed_images(self):
         """Wait for all five uploads and pending processing without re-uploading."""

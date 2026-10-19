@@ -2440,8 +2440,11 @@ _JS_WEB_COMPOSER_STATE = r"""(() => {
         ? nodes.map(read).join('\n') : read(composer);
   }
   const images = form ? [...form.querySelectorAll('img')]
-    .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || '')) : [];
+    .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || '') ||
+      ((i.src || '').startsWith('data:image/') && i.closest('[data-composer-attachments]'))) : [];
   const send = form && form.querySelector(SEL.send);
+  const busy = !!(form && form.querySelector('[role="progressbar"], [aria-busy="true"]'));
+  const sendReady = !!send && !send.disabled && send.getAttribute('aria-disabled') !== 'true';
   // A user message per turn. The redesign renders the whole thread twice, so
   // key each message by its turn container and count distinct turns; a marker
   // nested inside another marker (old role div around a bubble) is the same
@@ -2455,11 +2458,15 @@ _JS_WEB_COMPOSER_STATE = r"""(() => {
   return JSON.stringify({
     exists: !!composer, text,
     attachments: images.length,
-    // Blob thumbnails appear before the upload finishes. Only server-backed
-    // images count as ready; don't send with a partially uploaded batch.
-    ready: images.filter(i => !i.src.startsWith('blob:')).length,
-    busy: !!(form && form.querySelector('[role="progressbar"], [aria-busy="true"]')),
-    send_ready: !!send && !send.disabled && send.getAttribute('aria-disabled') !== 'true',
+    // The redesign keeps a data: thumbnail after upload. Require a decoded
+    // image in the attachment tray AND the composer's enabled Send control,
+    // with no pending upload indicator. A local preview alone proves nothing.
+    // Keep the older blob: rule: those previews never prove server readiness.
+    ready: images.filter(i => (i.src || '').startsWith('data:image/')
+      ? i.complete && i.naturalWidth > 0 && sendReady && !busy
+      : !i.src.startsWith('blob:')).length,
+    busy,
+    send_ready: sendReady,
     user_turns: turns.size,
   });
 })()"""
@@ -2515,8 +2522,13 @@ def _wait_web_uploads(ab, session, expected, remaining, emit) -> None:
 # upload" failure. `#upload-files` renders 0x0, but `upload` resolves and drives
 # hidden inputs fine, so no page-side injection is needed. The later entries keep
 # older / A-B-tested layouts working.
-_UPLOAD_SELECTORS = ("#upload-files", "form input[type=file]",
-                     'input[accept="image/*"]')
+# Preserve the legacy input first, then prefer a multi-file media input. The
+# redesign also exposes a capture="environment" camera input inside the form;
+# selecting the first generic file input can silently drop the reference.
+_UPLOAD_SELECTORS = ("#upload-files", 'form input[type=file][multiple][accept*="image/"]:not([capture])',
+                     'form input[type=file][multiple]:not([capture])',
+                     'form input[type=file]:not([capture])',
+                     'input[accept="image/*"]:not([capture])')
 
 
 def _upload_references(ab, session, ref_paths, remaining, emit) -> None:

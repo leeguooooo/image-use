@@ -30,5 +30,6 @@ jobs:
         run: |
           python -m unittest test_image_use -v
           python -m unittest discover -s tests -p test_release_source.py -v
+          python -m unittest discover -s tests -p test_web_data_attachments.py -v
       - name: Test install.sh
         run: sh tests/install.test.sh
