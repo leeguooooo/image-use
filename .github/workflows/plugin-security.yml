@@ -12,10 +12,11 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: hashgraph-online/ai-plugin-scanner-action@22cd8edc8f274a703db15155bfda971895fa687a # v1.2.635; scanner 3.0.123
+      - uses: hashgraph-online/ai-plugin-scanner-action@22cd8edc8f274a703db15155bfda971895fa687a # v1.2.787
         with:
           plugin_dir: .
           min_score: 80
           fail_on_severity: none
           online: false
           upload_sarif: false
+
