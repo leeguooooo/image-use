@@ -2439,6 +2439,42 @@ class UploadReferences(unittest.TestCase):
         else:
             self.fail("no media input matched")
 
+    def test_four_input_layout_uploads_once_to_unique_image_input(self):
+        """Use the image-only input when both media inputs could accept images."""
+        root = _parse('''<form>
+          <input type="file" accept="image/*" capture="environment">
+          <input type="file" accept="image/*,video/*" multiple>
+          <input type="file" accept="image/*" multiple>
+          <input type="file" multiple>
+        </form>''')
+        uploads, emitted = [], []
+
+        def fake_ab(ab, *args, session=None, timeout=None, profile=None):
+            """Reject ambiguous selectors as chrome-use does, then report success."""
+            if args[0] == "upload":
+                selector = args[1]
+                matched = _select(root, selector)
+                if not matched:
+                    raise cig.GatewayError(f"element not found: {selector}")
+                if len(matched) != 1:
+                    raise cig.GatewayError(
+                        f"{selector} matched {len(matched)} elements")
+                uploads.append(matched[0])
+                return ""
+            return json.dumps(json.dumps(
+                _composer_state(attachments=len(uploads))))
+
+        with unittest.mock.patch.object(cig, "_ab", fake_ab), \
+                unittest.mock.patch.object(cig.time, "sleep", lambda *_: None):
+            cig._upload_references("ab", "s", ["/tmp/a.png"],
+                                   lambda: 90.0, emitted.append)
+
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0].attrs.get("accept"), "image/*")
+        self.assertIn("multiple", uploads[0].attrs)
+        self.assertNotIn("capture", uploads[0].attrs)
+        self.assertIn("all 1 reference image(s) uploaded", emitted)
+
     def test_waits_for_all_five_server_backed_images(self):
         """Wait for all five uploads and pending processing without re-uploading."""
         states = [_composer_state(), _composer_state(attachments=1, ready=0),

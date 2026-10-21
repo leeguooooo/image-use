@@ -2568,10 +2568,14 @@ def _wait_web_uploads(ab, session, expected, remaining, emit) -> None:
 # upload" failure. `#upload-files` renders 0x0, but `upload` resolves and drives
 # hidden inputs fine, so no page-side injection is needed. The later entries keep
 # older / A-B-tested layouts working.
-# Preserve the legacy input first, then prefer a multi-file media input. The
-# redesign also exposes a capture="environment" camera input inside the form;
-# selecting the first generic file input can silently drop the reference.
-_UPLOAD_SELECTORS = ("#upload-files", 'form input[type=file][multiple][accept*="image/"]:not([capture])',
+# Preserve the legacy input first, then prefer the image-only multi-file input.
+# Some layouts also expose an image-or-video input; matching it broadly is
+# ambiguous there, so prefer an exact image accept before the media fallback.
+# The redesign also exposes a capture="environment" camera input inside the
+# form; selecting the first generic file input can silently drop the reference.
+_UPLOAD_SELECTORS = ("#upload-files",
+                     'form input[type=file][multiple][accept="image/*"]:not([capture])',
+                     'form input[type=file][multiple][accept*="image/"]:not([capture])',
                      'form input[type=file][multiple]:not([capture])',
                      'form input[type=file]:not([capture])',
                      'input[accept="image/*"]:not([capture])')
