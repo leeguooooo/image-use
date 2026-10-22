@@ -1132,6 +1132,398 @@ class Color(unittest.TestCase):
             cig._use_color = real
 
 
+class _RawStream(io.BytesIO):
+    """A byte sink that reports the TTY-ness the console codepage depends on."""
+
+    def __init__(self, tty):
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def _wrapped(tty=False, encoding="gbk", errors="strict", newline=None):
+    """(TextIOWrapper, byte sink) standing in for a Windows console or pipe.
+
+    encoding="gbk" is what CPython picks on a chcp 936 host, and newline=None
+    keeps the platform own line ending -- which is what a real stream does, so
+    an assertion about it asks the platform instead of hardcoding CRLF.
+    """
+    sink = _RawStream(tty)
+    stream = io.TextIOWrapper(sink, encoding=encoding, errors=errors,
+                              newline=newline, write_through=True)
+    return stream, sink
+
+
+def _line_end():
+    """The line ending a default TextIOWrapper produces on this platform."""
+    sink = io.BytesIO()
+    stream = io.TextIOWrapper(sink, encoding="utf-8", write_through=True)
+    stream.write("x\n")
+    stream.flush()
+    return sink.getvalue()[1:]
+
+
+@contextmanager
+def _env_restored(**updates):
+    """Set env vars for the block and put back exactly what was there before."""
+    previous = {k: os.environ.get(k) for k in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class StdioEncoding(unittest.TestCase):
+    """A GBK console must not turn a finished run into a traceback.
+
+    The success line printed after the image is already on disk carries glyphs
+    a 936 codepage lacks. That is a rendering problem, not a reason to report
+    failure -- but stdout's saved path is machine data, so it may only ever be
+    the literal name (see StdoutPathContract below).
+
+    stderr is deliberately absent here: CPython gives it
+    errors='backslashreplace' on every platform, so a diagnostic cannot raise
+    and the CLI leaves that stream completely alone.
+    """
+
+    def _soft(self, text, stream):
+        """Run _print_soft with stdout swapped for the given stream."""
+        with unittest.mock.patch.object(sys, "stdout", stream):
+            cig._print_soft(text)
+
+    def test_a_gbk_console_prints_the_success_line_instead_of_raising(self):
+        """The line loses only the glyphs the codepage cannot render."""
+        stream, sink = _wrapped()
+        self._soft("\u2713 saved \u2192 out.png", stream)
+        text = sink.getvalue().decode("gbk")
+        self.assertIn("saved", text)
+        self.assertIn("out.png", text)
+        self.assertIn(r"\u2713", text)     # escaped, not dropped
+
+    def test_soft_output_never_changes_the_stream_it_writes_through(self):
+        """The console keeps the encoding and error handler it was given."""
+        stream, _ = _wrapped(errors="strict")
+        self._soft("\u2713 saved \u2192 out.png", stream)
+        self.assertEqual((stream.encoding, stream.errors), ("gbk", "strict"))
+
+    def test_help_and_diagnostics_may_degrade_their_glyphs(self):
+        """Doctor's check marks and style badges are prose, not data."""
+        for text in ("  \u2713  python     3.14.3", "  \u2022 0.34.3: something",
+                     "ok \U0001f4ce2 refs", "\u26653 \u21e94 \u2014 a preview"):
+            with self.subTest(text=text):
+                stream, sink = _wrapped()
+                self._soft(text, stream)
+                self.assertTrue(sink.getvalue().decode("gbk"))
+
+    def test_a_stream_that_accepts_everything_is_written_verbatim(self):
+        """No escaping when the codepage can carry the text."""
+        stream, sink = _wrapped(encoding="utf-8")
+        self._soft("\u2713 \u732b \U0001f4ce", stream)
+        self.assertEqual(sink.getvalue().decode("utf-8"),
+                         "\u2713 \u732b \U0001f4ce" + _line_end().decode("utf-8"))
+
+    def test_stderr_is_never_reconfigured(self):
+        """The CLI does not touch a stream CPython already made fault-tolerant."""
+        source = inspect.getsource(cig)
+        self.assertNotIn(".reconfigure(", source)
+        self.assertNotIn("sys.stdin.reconfigure", source)
+
+    def test_the_parser_help_survives_a_codepage_without_the_glyph(self):
+        """style --help lists an option with a paperclip in it."""
+        stream, sink = _wrapped()
+        parser = cig._Parser(prog="image-use style")
+        parser.add_argument("--x", help="refs \U0001f4ce attached")
+        parser.print_help(file=stream)
+        text = sink.getvalue().decode("gbk")
+        self.assertIn("--x", text)          # the option name stays exact
+        self.assertIn("attached", text)
+
+    def test_cli_exits_zero_when_stdout_is_a_strict_gbk_redirect(self):
+        """End-to-end: the real script, a real GBK stream, real argparse help.
+
+        style --help is the cheapest real path that prints a glyph GBK lacks.
+        Decoded as GBK rather than via the host locale, because the point is
+        that the encoding is unchanged -- only a prose glyph degrades.
+        """
+        env = dict(os.environ, PYTHONIOENCODING="gbk:strict",
+                   IMAGE_USE_NO_UPDATE_CHECK="1")
+        result = subprocess.run([sys.executable, str(Path(__file__).parent / "image-use"),
+                                 "style", "--help"],
+                                env=env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertIn("list all assets", result.stdout.decode("gbk"))
+
+    def test_stdin_still_reads_the_confirmation_it_did_before(self):
+        """The input contract is untouched: style reset still asks and aborts.
+
+        A piped answer is decoded with the stream's own (unchanged) encoding,
+        and answering no leaves the library alone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, PYTHONIOENCODING="gbk:strict",
+                       IMAGE_USE_NO_UPDATE_CHECK="1", XDG_CONFIG_HOME=tmp)
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "image-use"), "style", "reset"],
+                input="\u5426\n".encode("gbk"), env=env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("aborted", result.stderr.decode("gbk"))
+
+
+class StdoutPathContract(unittest.TestCase):
+    """stdout carries the saved path literally -- or the run fails.
+
+    Callers do OUT=$(image-use ...) and then Path(out.strip()).is_file();
+    neither a question mark nor a \U0001d11e escape names the file that was
+    written, so a run that cannot print the real name must not exit 0.
+    """
+
+    @staticmethod
+    def _attempt(argv, *, encoding="gbk", stream_errors="strict", dispatch=None):
+        """Run the real main() in a temp cwd and report exactly what happened.
+
+        main() is the production entry point -- argv parsing, the preflight,
+        the save and the final path announcement are all real code; only the
+        backend call and the last-output bookkeeping are stubbed. Files are
+        inspected before the temp cwd disappears, so the assertions are about
+        the directory the CLI actually wrote into.
+
+        Pass a mock as `dispatch` when the test itself must prove the backend
+        was never called: the mock used *here* is the one main() resolves, so
+        an outer patch cannot be silently shadowed by this fixture's own.
+
+        stdout gets the encoding and handler under test; stderr gets what
+        CPython really installs (backslashreplace, in every encoder setting),
+        so the fixture reproduces the platform instead of a hand-made stream
+        that fails harder than the real one.
+
+        Returns (exit_code_or_rc, stdout_bytes, stderr_bytes, image_names,
+        stdout_resolves) where image_names lists every image file the run left
+        behind (any format, so a stray .webp is not invisible), and
+        stdout_resolves is the consumer's own move: take stdout as text, strip
+        it, and ask the filesystem whether it exists.
+        """
+        backend = (dispatch if dispatch is not None else
+                   unittest.mock.MagicMock(return_value=(_PNG_BYTES, {})))
+        with tempfile.TemporaryDirectory() as tmp, _in_tmp_cwd(), \
+                _env_restored(XDG_CONFIG_HOME=tmp, IMAGE_USE_NO_UPDATE_CHECK="1"):
+            out_sink, err_sink = _RawStream(False), _RawStream(False)
+            out = io.TextIOWrapper(out_sink, encoding=encoding,
+                                   errors=stream_errors, write_through=True)
+            err = io.TextIOWrapper(err_sink, encoding=encoding,
+                                   errors="backslashreplace", write_through=True)
+            with unittest.mock.patch.object(cig, "_dispatch", backend), \
+                 unittest.mock.patch.object(cig, "_record_last_output", lambda p: None), \
+                 unittest.mock.patch.object(cig, "_maybe_notify_update"), \
+                 unittest.mock.patch.object(cig, "_should_check_for_update",
+                                            return_value=False), \
+                 unittest.mock.patch.object(sys, "argv", ["image-use", *argv]), \
+                 unittest.mock.patch.object(sys, "stdout", out), \
+                 unittest.mock.patch.object(sys, "stderr", err):
+                try:
+                    code = cig.main()
+                except SystemExit as exit_:      # the preflight path exits early
+                    code = exit_.code
+            saved = sorted(p.name for p in Path(".").glob("**/*")
+                           if p.is_file()
+                           and p.suffix.lower() in (".png", ".jpg", ".jpeg",
+                                                    ".webp", ".gif"))
+            announced = out_sink.getvalue().decode(encoding, "replace").strip()
+            resolves = bool(announced) and Path(announced).is_file()
+            return code, out_sink.getvalue(), err_sink.getvalue(), saved, resolves
+
+    def test_an_ascii_path_is_captured_and_resolves_to_the_real_file(self):
+        """ASCII needs no special handling, on any platform."""
+        code, out, err, saved, resolves = self._attempt(
+            ["a cat", "-o", "cat.png", "--no-style"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, b"cat.png" + _line_end())
+        self.assertEqual(saved, ["cat.png"])
+        self.assertTrue(resolves)
+
+    def test_a_chinese_path_gbk_can_carry_still_names_the_real_file(self):
+        """The codepage expresses it, so it goes out byte-for-byte."""
+        code, out, err, saved, resolves = self._attempt(
+            ["a cat", "-o", "\u732b.png", "--no-style"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, "\u732b.png".encode("gbk") + _line_end())
+        self.assertEqual(saved, ["\u732b.png"])
+        self.assertTrue(resolves)
+
+    def test_an_unrepresentable_target_is_refused_before_generating(self):
+        """-o is known up front, so a doomed run never spends a generation."""
+        dispatch = unittest.mock.MagicMock(return_value=(_PNG_BYTES, {}))
+        code, out, err, saved, resolves = self._attempt(
+            ["a cat", "-o", "\U0001d11e.png", "--no-style"], dispatch=dispatch)
+        self.assertEqual(dispatch.call_count, 0)        # no generation happened
+        self.assertEqual(out, b"")
+        self.assertEqual(saved, [])                     # nothing was written
+        # sys.exit(message) hands the message to the interpreter, which prints
+        # it on stderr and exits 1 -- the CLI-visible behaviour without matching
+        # a specific exit path here.
+        message = code if isinstance(code, str) else err.decode("gbk")
+        self.assertTrue(code)                           # non-zero: no false success
+        self.assertIn("cannot print the path", message)
+        self.assertIn("PYTHONIOENCODING=utf-8", message)
+        # The refusal happens before generation, so the diagnostic must not
+        # tell the caller to look for a saved image.
+        self.assertIn("No image was generated or downloaded", message)
+        self.assertNotIn("saved", message.lower())
+
+    def test_the_preflight_refusal_really_exits_nonzero_with_empty_stdout(self):
+        """The interpreter-visible contract, not just the in-process return.
+
+        Same production script, a real child process and a GBK stdout: no
+        image is written, exit is non-zero, stdout is empty, and stderr neither
+        claims a save nor invents a path.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, PYTHONIOENCODING="gbk:strict",
+                       IMAGE_USE_NO_UPDATE_CHECK="1")
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "image-use"),
+                 "a cat", "-o", "\U0001d11e.png", "--no-style"],
+                env=env, cwd=tmp, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(list(Path(tmp).glob("**/*.png")), [])
+        message = result.stderr.decode("gbk")
+        self.assertIn("No image was generated or downloaded", message)
+        self.assertNotIn("saved", message.lower())
+
+    def test_an_unrepresentable_animation_target_is_refused_before_generating(self):
+        """animate resolves the real .webp target, then stops before both the
+        generation and the renderer."""
+        dispatch = unittest.mock.MagicMock(return_value=(_PNG_BYTES, {}))
+        render = unittest.mock.MagicMock()
+        # Keep the real _animation_preflight order but do not depend on this
+        # host having ImageMagick/libwebp installed.
+        with unittest.mock.patch.object(cig.shutil, "which", return_value="stub"), \
+             unittest.mock.patch.object(cig, "_render_animation", render):
+            code, out, err, saved, resolves = self._attempt(
+                ["animate", "a cat", "-o", "\U0001d11e.webp", "--no-style"],
+                dispatch=dispatch)
+        self.assertEqual(dispatch.call_count, 0)
+        self.assertEqual(render.call_count, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(saved, [])                     # not even a sprite sheet
+        message = code if isinstance(code, str) else err.decode("gbk")
+        self.assertTrue(code)
+        self.assertIn("No image was generated or downloaded", message)
+        self.assertNotIn("saved", message.lower())
+
+    def test_an_unrepresentable_recover_target_is_refused_before_downloading(self):
+        """recover checks -o before it looks for a browser or fetches bytes."""
+        browser = unittest.mock.MagicMock()
+        site_call = unittest.mock.MagicMock()
+        fetch = unittest.mock.MagicMock()
+        with unittest.mock.patch.object(cig, "_find_agent_browser", browser), \
+             unittest.mock.patch.object(cig, "_site_call", site_call), \
+             unittest.mock.patch.object(cig, "_ab_eval", fetch):
+            code, out, err, saved, resolves = self._attempt(
+                ["recover", "https://chatgpt.com/c/abc", "-o", "\U0001d11e.png"])
+        browser.assert_not_called()                     # no browser was located
+        site_call.assert_not_called()                   # no conversation read
+        fetch.assert_not_called()                       # no download attempted
+        self.assertEqual(out, b"")
+        self.assertEqual(saved, [])
+        message = code if isinstance(code, str) else err.decode("gbk")
+        self.assertTrue(code)
+        self.assertIn("No image was generated or downloaded", message)
+        self.assertNotIn("saved", message.lower())
+
+    def test_a_path_settled_after_the_save_fails_instead_of_inventing_one(self):
+        """The reported bug: exit 0 with an escaped path that no file has.
+
+        A name only known once the bytes exist (here: the derived default) is
+        checked at the announcement. The image is already on disk -- what
+        changes is that the run no longer claims success while handing the
+        caller a name that does not exist.
+        """
+        with unittest.mock.patch.object(
+                cig, "_default_out_path",
+                lambda prompt, fmt: Path("\U0001d11e." + fmt)):
+            code, out, err, saved, resolves = self._attempt(["a cat", "--no-style"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, b"")                      # nothing to misread
+        self.assertFalse(resolves)                      # and nothing resolvable
+        self.assertEqual(saved, ["\U0001d11e.png"])     # the image really landed
+        message = err.decode("gbk")
+        self.assertIn("cannot print the path", message)
+        self.assertIn("PYTHONIOENCODING=utf-8", message)
+        # Here the save did happen, so the diagnostic says the artifact exists
+        # instead of borrowing the preflight's "not generated" wording.
+        self.assertIn("The image was saved under exactly that name", message)
+        self.assertNotIn("No image was generated or downloaded", message)
+
+    def test_the_same_path_succeeds_on_a_utf8_stdout(self):
+        """An explicit UTF-8 stream is the documented way to pass such names."""
+        code, out, err, saved, resolves = self._attempt(
+            ["a cat", "-o", "\U0001d11e.png", "--no-style"], encoding="utf-8")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, "\U0001d11e.png".encode("utf-8") + _line_end())
+        self.assertEqual(saved, ["\U0001d11e.png"])
+        self.assertTrue(resolves)
+
+    def test_a_lossless_error_handler_still_prints_the_literal_path(self):
+        """surrogateescape round-trips POSIX raw-byte names, so it is no loss.
+
+        Rejecting it would break byte-exact POSIX filenames; the check is a
+        round trip through the stream's own codec and handler, not a hunt for
+        the word "strict".
+        """
+        name = b"file-\xe9.png".decode("utf-8", "surrogateescape")
+        stream, _ = _wrapped(encoding="utf-8", errors="surrogateescape")
+        self.assertTrue(cig._encodes_exactly(stream, name))
+        self.assertIsNone(cig._path_problem(stream, Path(name)))
+
+    def test_a_lossy_error_handler_is_not_accepted_as_exact(self):
+        """replace/backslashreplace produce a different name -- never exact."""
+        for errors in ("replace", "backslashreplace", "ignore"):
+            with self.subTest(errors=errors):
+                stream, _ = _wrapped(errors=errors)
+                self.assertFalse(cig._encodes_exactly(stream, "\U0001d11e.png"))
+                self.assertIsNotNone(cig._path_problem(stream, Path("\U0001d11e.png")))
+
+    def test_a_stream_without_a_codec_is_treated_as_exact(self):
+        """StringIO and doubles keep characters as they are; nothing to check."""
+        self.assertTrue(cig._encodes_exactly(io.StringIO(), "\U0001d11e.png"))
+        self.assertIsNone(cig._path_problem(io.StringIO(), Path("\U0001d11e.png")))
+
+    def test_recover_prints_its_paths_under_the_same_contract(self):
+        """The other stdout path list: literal when printable, in order."""
+        saved = [Path("a") / "\u732b.png", Path("a") / "\u732b-2.png"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertTrue(cig._print_saved_paths(saved))
+        self.assertEqual(out.getvalue(), "".join(f"{p}\n" for p in saved))
+
+    def test_a_bad_path_in_the_list_fails_the_whole_list(self):
+        """All-or-nothing: a caller never gets a partial answer."""
+        stream, sink = _wrapped()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            ok = cig._print_saved_paths([Path("a.png"), Path("\U0001d11e.png")],
+                                        stream=stream)
+        self.assertFalse(ok)
+        self.assertEqual(sink.getvalue(), b"")   # not even the printable one
+        message = err.getvalue()
+        self.assertIn("cannot print the path", message)
+        # _print_saved_paths runs after the save; its list form says so.
+        self.assertIn("The images were saved under exactly those names", message)
+        self.assertNotIn("No image was generated or downloaded", message)
+
+
 def _write_png(path) -> str:
     """Write a tiny but valid-enough PNG (passes _sniff_mime). Returns the path."""
     Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)

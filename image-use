@@ -1187,6 +1187,145 @@ def _fmt_progress(elapsed: float, msg: str) -> str:
     return line + (_yellow(msg) if any(w in low for w in _WARN_WORDS) else msg)
 
 
+def _encodes_exactly(stream: Any, text: str) -> bool:
+    """True when the stream can carry text without substituting anything.
+
+    The test is a round trip through the stream's own encoding AND its own
+    error handler, so a lossless handler still counts: a POSIX stdout using
+    surrogateescape writes a raw-byte filename back out byte-for-byte, and
+    decoding it the same way returns the same string. A handler that swaps or
+    escapes characters (replace, ignore, backslashreplace) fails the
+    comparison, which is the point: those name a different file.
+
+    Streams without a codec (io.StringIO, a test double) always pass: they keep
+    the characters as they are.
+    """
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    errors = getattr(stream, "errors", None) or "strict"
+    try:
+        return text.encode(encoding, errors).decode(encoding, errors) == text
+    except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+        return False
+
+
+def _path_problem(stream: Any, path: Path) -> str | None:
+    """Why this path cannot be announced on this stream, or None when it can.
+
+    stdout *is* the machine-readable path: callers do OUT=$(image-use ...) and
+    then Path(out.strip()).is_file(). So stdout may only ever carry the real
+    name. A codepage that lacks the characters cannot be asked to approximate
+    it -- a "?" or a "\\U0001d11e" escape is a path to a file that does not
+    exist, and exiting 0 on it would silently break the contract this CLI
+    documents. The encoding itself is left alone (changing it would misread the
+    caller's own console, pipe or redirect); the limit is reported instead.
+
+    This diagnoses only the encoding. Whether the file exists depends on the
+    caller's stage: _preflight_saved_paths runs before any generation, while
+    _print_saved_paths runs after the bytes landed. Each adds the phase fact,
+    so a shared sentence never claims a save that did not happen.
+    """
+    if _encodes_exactly(stream, str(path)):
+        return None
+    encoding = getattr(stream, "encoding", None) or "?"
+    return (
+        f"cannot print the path to stdout: {ascii(str(path))} is not "
+        f"representable in stdout's encoding {encoding!r}, and any substitution "
+        f"would name a different file. Re-run with PYTHONIOENCODING=utf-8 and "
+        f"read stdout as UTF-8 to pass the path through a pipe.")
+
+
+def _print_saved_paths(paths: list[Path], stream: Any = None) -> bool:
+    """Print the saved path(s) on stdout exactly, or report why we cannot.
+
+    All-or-nothing: every path is checked before the first is written, so a
+    caller either gets the complete literal list or an error -- never a partial
+    or escaped answer. This runs after the files are written, so a failure here
+    says the artifacts are still on disk.
+    """
+    stream = sys.stdout if stream is None else stream
+    for path in paths:
+        problem = _path_problem(stream, path)
+        if problem:
+            saved = ("The image was saved under exactly that name."
+                     if len(paths) == 1 else
+                     "The images were saved under exactly those names.")
+            print(f"error: {problem} {saved}", file=sys.stderr)
+            return False
+    for path in paths:
+        print(path, file=stream)
+    return True
+
+
+def _preflight_saved_paths(paths: list[Path]) -> None:
+    """Refuse before generating when stdout provably cannot announce the target.
+
+    A path the caller already named with -o is known up front, so an
+    unrepresentable name is a cheap refusal here instead of a generated image
+    whose path can never be printed. A derived default name is an ASCII slug,
+    and anything settled only after the save is handled at print time.
+
+    Nothing has been generated or downloaded at this point; the diagnostic says
+    so explicitly, because a caller must not go looking for a file that was
+    never created.
+    """
+    for path in paths:
+        problem = _path_problem(sys.stdout, path)
+        if problem:
+            sys.exit(f"error: {problem} No image was generated or downloaded.")
+
+
+def _write_soft(stream: Any, text: str) -> None:
+    """Write human-facing text, degrading glyphs the codepage cannot carry.
+
+    Only for help, progress and diagnostics: those may lose a pictogram and
+    still say what they mean. Machine stdout (the saved path list, --json)
+    never comes through here -- see _print_saved_paths.
+
+    The stream's encoding and error handler are left untouched; only this one
+    string is escaped when the normal write would raise. TextIOWrapper encodes
+    the whole string before touching the sink, so a failed write emits nothing
+    and the escaped retry carries the complete message.
+    """
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        stream.write(text.encode(encoding, "backslashreplace").decode(encoding, "strict"))
+
+
+def _print_soft(*args: Any) -> None:
+    """print() to stdout for help and diagnostic text: never dies over a glyph.
+
+    A 936 console cannot render the check marks, arrows and paperclips these
+    lines use; raising there turned a working command into a traceback. Nothing
+    parses them (the saved path goes through _print_saved_paths instead), so a
+    degraded glyph is harmless -- unlike a substituted path.
+
+    stderr needs no equivalent: CPython already gives it errors='backslashreplace'
+    on every platform, so a diagnostic there cannot raise.
+    """
+    try:
+        print(*args)
+    except UnicodeEncodeError:
+        _write_soft(sys.stdout, " ".join(str(a) for a in args) + "\n")
+
+
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser whose help/usage survives a codepage missing the glyphs.
+
+    style --help lists an option with a paperclip in it, and argparse writes
+    help straight to the stream; on a GBK console that raised. Help is prose,
+    so a glyph may degrade to an escape while option names stay exact.
+    Subparsers inherit this class from their parent.
+    """
+
+    def _print_message(self, message: str, file: Any = None) -> None:
+        if message:
+            _write_soft(file or sys.stdout, message)
+
+
 def _chrome_use_version(ab: str) -> str | None:
     """chrome-use's dotted version (e.g. '1.5.28'), or None if unreadable.
     Shared by the old-version warning and `doctor`."""
@@ -5624,7 +5763,7 @@ def _upload_command(argv: list[str]) -> int:
     The ONLY path that posts an image to the platform: uploading is the user's
     call, made after they've seen the result — generation never auto-pushes.
     """
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="image-use upload",
         description="Push one image to a drawstyle style's player gallery "
                     f"(anonymous — no login; ≤{UPLOAD_MAX_BYTES // (1024 * 1024)} "
@@ -5643,7 +5782,7 @@ def _upload_command(argv: list[str]) -> int:
 
 def _style_command(argv: list[str]) -> int:
     """`image-use style <verb> ...` — manage style presets."""
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="image-use style",
         description="Manage reusable prompt-style presets "
                     f"(stored in {_styles_path()}).")
@@ -5710,14 +5849,14 @@ def _style_command(argv: list[str]) -> int:
             "GET", "/api/styles" + (f"?{qs}" if qs else ""))
         rows = data.get("styles") or []
         if not rows:
-            print("no styles found")
+            _print_soft("no styles found")
             return 0
         for style in rows:
             preview = " ".join((style.get("snippet") or "").split())[:60]
-            print(f"{style['slug']} [{style['kind']}] ({style['category']}) "
-                  f"♥{style.get('likes_count', 0)} "
-                  f"⇩{style.get('pulls_count', 0)} — {preview}")
-            print(f"    image-use style pull {style['slug']}")
+            _print_soft(f"{style['slug']} [{style['kind']}] ({style['category']}) "
+                        f"♥{style.get('likes_count', 0)} "
+                        f"⇩{style.get('pulls_count', 0)} — {preview}")
+            _print_soft(f"    image-use style pull {style['slug']}")
         return 0
 
     doc = _load_styles()
@@ -5840,7 +5979,7 @@ def _style_command(argv: list[str]) -> int:
                 and entry["origin"].get("slug")
             ]
         if not candidates:
-            print("no pulled styles")
+            _print_soft("no pulled styles")
             return 0
 
         for name, origin in candidates:
@@ -5849,7 +5988,7 @@ def _style_command(argv: list[str]) -> int:
             detail = _platform_request("GET", f"/api/styles/{slug}")
             remote = int(detail.get("version") or 0)
             if remote <= current:
-                print(f"{name}: up to date (v{current})")
+                _print_soft(f"{name}: up to date (v{current})")
                 continue
             pkg = _platform_request("GET", f"/api/styles/{slug}/package")
             stored = _apply_package(doc, name, pkg)
@@ -5857,13 +5996,13 @@ def _style_command(argv: list[str]) -> int:
             # consistent partial state (earlier entries' on-disk refs match the
             # saved doc) instead of unsaved edits diverging from disk.
             _save_styles(doc)
-            print(f"{name}: updated v{current} -> v{pkg['version']} "
-                  f"({len(stored)} ref{'s' if len(stored) != 1 else ''})")
+            _print_soft(f"{name}: updated v{current} -> v{pkg['version']} "
+                        f"({len(stored)} ref{'s' if len(stored) != 1 else ''})")
         return 0
 
     if a.verb == "list":
         if not styles:
-            print("(no styles)")
+            _print_soft("(no styles)")
             return 0
         default = doc.get("default") or []
         for name in sorted(styles):
@@ -5874,24 +6013,24 @@ def _style_command(argv: list[str]) -> int:
             nrefs = len(entry.get("refs") or [])
             badge = f" 📎{nrefs}" if nrefs else ""
             mark = "*" if name in default else " "
-            print(f"{mark} {name} [{entry.get('kind', 'style')}]{badge}: {preview}")
+            _print_soft(f"{mark} {name} [{entry.get('kind', 'style')}]{badge}: {preview}")
         if default:
-            print(f"\n* = active default ({', '.join(default)})")
+            _print_soft(f"\n* = active default ({', '.join(default)})")
         else:
-            print("\n(no active default — pass --style NAME to apply one)")
+            _print_soft("\n(no active default — pass --style NAME to apply one)")
         return 0
 
     if a.verb == "show":
         if a.name not in styles:
             _die_unknown_style(a.name, styles)
         entry = styles[a.name]
-        print(f"kind: {entry.get('kind', 'style')}")
+        _print_soft(f"kind: {entry.get('kind', 'style')}")
         if entry.get("snippet"):
-            print(f"snippet: {entry['snippet']}")
+            _print_soft(f"snippet: {entry['snippet']}")
         refs = entry.get("refs") or []
         if refs:
-            print(f"refs: {', '.join(refs)}")
-        print(f"path: {_asset_dir(a.name)}")
+            _print_soft(f"refs: {', '.join(refs)}")
+        _print_soft(f"path: {_asset_dir(a.name)}")
         return 0
 
     if a.verb == "add":
@@ -6049,9 +6188,9 @@ def _doctor_command(argv: list[str]) -> int:
     }
 
     def line(status: str, label: str, detail: str) -> None:
-        print(f"  {sym[status]}  {label:<11}{detail}")
+        _print_soft(f"  {sym[status]}  {label:<11}{detail}")
 
-    print("image-use doctor\n")
+    _print_soft("image-use doctor\n")
 
     pv = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     ok_py = sys.version_info >= (3, 10)
@@ -6062,11 +6201,11 @@ def _doctor_command(argv: list[str]) -> int:
         line("warn", "version",
              f"{__version__} → {latest} 可用 (image-use upgrade)")
         for ver, note in _changes_since(notes)[:5]:
-            print(f"               • {ver}:{note}")
+            _print_soft(f"               • {ver}:{note}")
     else:
         line("ok", "version", __version__ + (" (latest)" if latest else ""))
 
-    parser = argparse.ArgumentParser(prog="image-use doctor")
+    parser = _Parser(prog="image-use doctor")
     parser.add_argument("--codex-provider", default=_env("IMAGE_USE_CODEX_PROVIDER"))
     provider_name = parser.parse_known_args(argv)[0].codex_provider
     if provider_name:
@@ -6083,7 +6222,7 @@ def _doctor_command(argv: list[str]) -> int:
              "OAuth token present (~/.codex/auth.json)" if codex_ready
              else "no token — run `codex login`")
 
-    print("\n  animation:")
+    _print_soft("\n  animation:")
     magick = shutil.which("magick")
     img2webp = shutil.which("img2webp")
     line("ok" if magick else "warn", "magick",
@@ -6091,7 +6230,7 @@ def _doctor_command(argv: list[str]) -> int:
     line("ok" if img2webp else "warn", "img2webp",
          img2webp or "not installed — needed for animated WebP")
 
-    print("\n  web backend:")
+    _print_soft("\n  web backend:")
     ab = _find_agent_browser()
     relay = False
     profiles: list[str] = []
@@ -6115,7 +6254,7 @@ def _doctor_command(argv: list[str]) -> int:
         else:
             line("fail", "profiles", "none detected — sign in to chatgpt.com")
 
-    print("\n  gemini backends (opt-in — never chosen by auto):")
+    _print_soft("\n  gemini backends (opt-in — never chosen by auto):")
     g_profiles = _detect_google_profiles() if ab is not None else []
     pinned = _env("IMAGE_USE_GEMINI_PROFILE")
     if ab is None:
@@ -6137,12 +6276,12 @@ def _doctor_command(argv: list[str]) -> int:
     web_ready = _web_ready(ab is not None, relay, len(profiles))
     pick = _auto_backend_pick(web_ready, codex_ready)
     arrow = _dim("→", stream=sys.stdout) if color else "→"
-    print()
+    _print_soft()
     if pick == "neither":
-        print(f"  {arrow} auto: no backend ready — set up one of the above.\n")
+        _print_soft(f"  {arrow} auto: no backend ready — set up one of the above.\n")
         return 1
     note = "spares Codex-usage" if pick == "web" else "bills Codex-usage"
-    print(f"  {arrow} auto would use: {pick}  ({note})\n")
+    _print_soft(f"  {arrow} auto would use: {pick}  ({note})\n")
     return 0
 
 
@@ -6207,7 +6346,7 @@ def _recover_command(argv: list[str]) -> int:
     chrome-use-sites `chatgpt/images` adapter (the server's list of the
     conversation's images, with signed download URLs) instead of prompting again.
     """
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="image-use recover",
         description="Download the image(s) ChatGPT generated in an existing "
                     "conversation, without submitting anything.")
@@ -6226,6 +6365,10 @@ def _recover_command(argv: list[str]) -> int:
     parser.add_argument("--quiet", action="store_true",
                         help="Print only the saved path(s)")
     args = parser.parse_args(argv)
+    # A named target is known before any download; derived "-2" names share its
+    # stem, so checking the base covers the whole set.
+    if args.out:
+        _preflight_saved_paths([Path(args.out)])
     progress = not args.quiet
     start = time.monotonic()
 
@@ -6305,9 +6448,8 @@ def _recover_command(argv: list[str]) -> int:
             except Exception:
                 pass
     _record_last_output(saved[-1])
-    for out in saved:
-        print(out)
-    return 0
+    # Same stdout contract as a generation: the literal paths, all or nothing.
+    return 0 if _print_saved_paths(saved) else 1
 
 
 _HELP_EPILOG = """\
@@ -6549,7 +6691,7 @@ def _install_cli(route: str, where: Path, latest: str) -> int:
     if route == "claude-plugin":
         return 0  # the plugin refresh in step 2 replaces this file
     if route == "git":
-        print(f"cli: git -C {where} pull --ff-only")
+        _print_soft(f"cli: git -C {where} pull --ff-only")
         rc, out = _run_step(["git", "-C", str(where), "pull", "--ff-only"])
         if rc != 0:
             print(f"error: git pull failed (not forcing): {out}", file=sys.stderr)
@@ -6561,14 +6703,14 @@ def _install_cli(route: str, where: Path, latest: str) -> int:
             print("error: neither `skills` nor `npx` is on PATH; install Node, then run:\n"
                   f"  npx -y skills update {_installed_skill_name()}", file=sys.stderr)
             return 1
-        print("cli: " + " ".join(argv))
+        _print_soft("cli: " + " ".join(argv))
         try:
             rc = subprocess.run(argv).returncode
         except OSError as e:
             print(f"error: cannot run `skills update`: {e}", file=sys.stderr)
             return 1
         return rc
-    print(f"cli: replacing {where} with the v{latest} release")
+    _print_soft(f"cli: replacing {where} with the v{latest} release")
     return _replace_script(where, latest)
 
 
@@ -6578,25 +6720,25 @@ def _refresh_skill(skill: dict, cli_route: str, cli_where: Path) -> int:
     channel, path = skill["channel"], skill["path"]
     label = f"skill [{channel}] {path}:"
     if channel == "git" and cli_route == "git" and Path(path) == cli_where:
-        print(f"{label} pulled above")
+        _print_soft(f"{label} pulled above")
     elif channel == "git":
         rc, out = _run_step(["git", "-C", path, "pull", "--ff-only"])
-        print(f"{label} " + ("pulled" if rc == 0
+        _print_soft(f"{label} " + ("pulled" if rc == 0
                              else f"not updated (git pull --ff-only failed: {out})"))
         return 1 if rc else 0
     elif channel == "claude-plugin":
         claude = shutil.which("claude")
         if claude is None:
-            print(f"{label} run: {skill['update']}")
+            _print_soft(f"{label} run: {skill['update']}")
             return 0
         rc, out = _run_step([claude, *skill["update"].split()[1:]])
-        print(f"{label} " + ("updated" if rc == 0
+        _print_soft(f"{label} " + ("updated" if rc == 0
                              else f"`{skill['update']}` failed: {out}"))
         return 1 if rc else 0
     elif channel == "copy" and cli_route == "skills":
-        print(f"{label} refreshed by the skills manager above")
+        _print_soft(f"{label} refreshed by the skills manager above")
     else:
-        print(f"{label} run: {skill['update']}")
+        _print_soft(f"{label} run: {skill['update']}")
     return 0
 
 
@@ -6606,7 +6748,7 @@ def _upgrade_command(argv: list[str]) -> int:
     Reserving these words as a subcommand also keeps `image-use upgrade` from
     silently becoming an image prompt. Exit 0 on success (upgraded, already
     current, or a check that ran), 2 when the check or download failed."""
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="image-use upgrade",
         description="Install the latest image-use release and refresh the skill.")
     parser.add_argument("--check", action="store_true",
@@ -6632,12 +6774,12 @@ def _upgrade_command(argv: list[str]) -> int:
         print(f"error: could not read the latest release from {UPDATE_RELEASES_URL}",
               file=sys.stderr)
         return 2
-    print(f"image-use {__version__} -> {latest}" if available
-          else f"image-use {__version__} is up to date")
+    _print_soft(f"image-use {__version__} -> {latest}" if available
+                else f"image-use {__version__} is up to date")
     if args.check:
         for skill in skills:
-            print(f"skill [{skill['channel']}] {skill['path']} "
-                  f"(refresh: {skill['update']})")
+            _print_soft(f"skill [{skill['channel']}] {skill['path']} "
+                        f"(refresh: {skill['update']})")
         return 0
 
     route, where = _cli_install_route()
@@ -6646,7 +6788,7 @@ def _upgrade_command(argv: list[str]) -> int:
     rc = 0
     if available:
         for ver, note in _changes_since(_fetch_whatsnew(latest))[:10]:
-            print(f"  • {ver}: {note}")
+            _print_soft(f"  • {ver}: {note}")
         rc = _install_cli(route, where, latest)
     refresh_failed = 0
     for skill in skills:
@@ -6655,17 +6797,17 @@ def _upgrade_command(argv: list[str]) -> int:
     if rc == 0 and available:
         if route == "git":
             # A pull follows the checkout's branch, which may be past the tag.
-            print(f"pulled {where} (it follows its branch; the latest release "
-                  f"is {latest}); the next run uses the new code")
+            _print_soft(f"pulled {where} (it follows its branch; the latest release "
+                        f"is {latest}); the next run uses the new code")
         elif route == "claude-plugin":
             # `claude plugin update` installs what the marketplace lists,
             # which can lag the GitHub release.
-            print(f"refreshed the Claude Code plugin (it installs the version the "
-                  f"marketplace lists, which can trail release {latest}); "
-                  f"check with `image-use --version`")
+            _print_soft(f"refreshed the Claude Code plugin (it installs the version the "
+                        f"marketplace lists, which can trail release {latest}); "
+                        f"check with `image-use --version`")
         else:
-            print(f"upgraded to {latest} (this process is still {__version__}; "
-                  f"the next run uses the new version)")
+            _print_soft(f"upgraded to {latest} (this process is still {__version__}; "
+                        f"the next run uses the new version)")
     return rc or refresh_failed
 
 
@@ -6688,7 +6830,7 @@ def main() -> int:
     animate_mode = bool(argv and argv[0] == "animate")
     if animate_mode:
         argv = argv[1:]
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description=(
             "Generate an 8-frame looping animation with your ChatGPT subscription."
             if animate_mode else
@@ -7022,6 +7164,10 @@ def main() -> int:
             _animation_preflight(animation_format, args.also_gif)
         except AnimationError as error:
             parser.error(str(error))
+    # -o is resolved now, so an unrepresentable name can stop the run before it
+    # spends a generation (the post-save print guard stays authoritative).
+    _preflight_saved_paths([animation_out_path] if animate_mode
+                           else ([Path(args.out)] if args.out else []))
     progress = not args.no_progress
     _styles_doc = _load_styles()
     # Self-heal the styles that are about to be applied — explicit `--style NAME`
@@ -7186,8 +7332,10 @@ def main() -> int:
     if getattr(args, "open_after", False):
         _open_file(out_path, progress)
     # stdout is always exactly the saved path, one line — safe for `$(...)` capture.
-    print(out_path)
-    return 0
+    # It is written literally (never escaped or substituted): a caller may hand
+    # it straight to Path().is_file(). When stdout's codepage cannot carry the
+    # name, say so and fail rather than announce a path that does not exist.
+    return 0 if _print_saved_paths([out_path]) else 1
 
 
 if __name__ == "__main__":
