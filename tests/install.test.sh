@@ -21,7 +21,7 @@ CO="$TMP/home/.agents/use-family/image-use"
 
 fresh; out=$(sh < "$REPO/install.sh")
 [ "$(readlink "$HOME/.local/bin/image-use")" = "$CO/image-use" ] || fail "piped: CLI linked to $(readlink "$HOME/.local/bin/image-use")"
-[ "$(readlink "$HOME/.agents/skills/image-use")" = "$CO" ] || fail "piped: skill linked to $(readlink "$HOME/.agents/skills/image-use")"
+[ "$(readlink "$HOME/.agents/skills/image-use")" = "$CO/skills/image-use" ] || fail "piped: skill linked to $(readlink "$HOME/.agents/skills/image-use")"
 [ -L "$HOME/.claude/skills/image-use" ] || fail "piped: no Claude Code skill link without the plugin"
 "$HOME/.local/bin/image-use" --version | grep -q '^image-use [0-9]' || fail "piped: linked CLI does not run"
 echo "$out" | grep -q '^installed image-use [0-9]' || fail "piped: no installed line"
@@ -48,5 +48,18 @@ echo "$out" | grep -q '^installed image-use [0-9]' || fail "old python3: no inst
 # Re-run once python3 is new enough: our wrapper becomes the plain link again.
 sh < "$REPO/install.sh" >/dev/null
 [ "$(readlink "$HOME/.local/bin/image-use")" = "$CO/image-use" ] || fail "re-run: wrapper not swapped back for the link"
+
+# A managed link from the root layout migrates, while an older checkout remains usable.
+fresh; mkdir -p "$HOME/.agents/skills"; ln -s "$REPO" "$HOME/.agents/skills/image-use"
+sh "$REPO/install.sh" >/dev/null
+[ "$(readlink "$HOME/.agents/skills/image-use")" = "$REPO/skills/image-use" ] || fail "managed root link was not migrated"
+mkdir -p "$TMP/legacy"; cp "$REPO/image-use" "$REPO/install.sh" "$TMP/legacy/"
+cp "$REPO/skills/image-use/SKILL.md" "$TMP/legacy/SKILL.md"
+fresh; sh "$TMP/legacy/install.sh" >/dev/null
+[ "$(readlink "$HOME/.agents/skills/image-use")" = "$TMP/legacy" ] || fail "legacy root checkout no longer works"
+# User-maintained directories are never overwritten.
+fresh; mkdir -p "$HOME/.agents/skills/image-use"; echo owned > "$HOME/.agents/skills/image-use/marker"
+sh "$REPO/install.sh" >/dev/null
+[ "$(cat "$HOME/.agents/skills/image-use/marker")" = owned ] || fail "user Skill directory changed"
 
 echo "ok install.sh"

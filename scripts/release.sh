@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 git pull -q --ff-only
 [ -z "$(git ls-remote --tags origin "refs/tags/v$V")" ] || { echo "error: v$V already exists" >&2; exit 1; }
 
-[ -z "$DRY" ] || trap 'git checkout -q -- image-use SKILL.md' EXIT
+[ -z "$DRY" ] || trap 'git checkout -q -- image-use skills/image-use/SKILL.md skills/image-use/image-use' EXIT
 # The three things release.yml checks: CLI __version__, SKILL.md version, a WHATSNEW line for it.
 V="$V" NOTE="$NOTE" python3 - <<'PY'
 import os, re
@@ -32,8 +32,9 @@ cli = Path("image-use").read_text(encoding="utf-8")
 cli = re.sub(r'^__version__ = ".*"$', f'__version__ = "{v}"', cli, count=1, flags=re.M)
 cli = re.sub(r"^(# WHATSNEW\[)", lambda m: f"# WHATSNEW[{v}]: {note}\n" + m.group(1), cli, count=1, flags=re.M)
 Path("image-use").write_text(cli, encoding="utf-8")
-skill = Path("SKILL.md").read_text(encoding="utf-8")
-Path("SKILL.md").write_text(re.sub(r'^version: ".*"$', f'version: "{v}"', skill, count=1, flags=re.M), encoding="utf-8")
+Path("skills/image-use/image-use").write_bytes(Path("image-use").read_bytes())
+skill = Path("skills/image-use/SKILL.md").read_text(encoding="utf-8")
+Path("skills/image-use/SKILL.md").write_text(re.sub(r'^version: ".*"$', f'version: "{v}"', skill, count=1, flags=re.M), encoding="utf-8")
 PY
 python3 -m py_compile image-use chatgpt-imagegen
 python3 -m unittest test_image_use -q
