@@ -10,6 +10,7 @@ Run:  python3 -m unittest test_image_use -v
 """
 
 import argparse
+import atexit
 import base64
 import html.parser
 import importlib.machinery
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import ssl
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -38,6 +40,13 @@ _loader = importlib.machinery.SourceFileLoader(
 _spec = importlib.util.spec_from_loader("cig", _loader)
 cig = importlib.util.module_from_spec(_spec)
 _loader.exec_module(cig)
+
+# Never let a test touch the real ~/.cache: `upgrade` paths write the update-check
+# cache, and a patched fetch returning a fake "9.9.9" once leaked into a user's
+# real update-check.json (issue #66). Tests that need a cache use their own.
+_TEST_CACHE = tempfile.mkdtemp(prefix="image-use-test-cache.")
+os.environ["XDG_CACHE_HOME"] = _TEST_CACHE
+atexit.register(shutil.rmtree, _TEST_CACHE, True)
 
 
 @contextmanager
@@ -1073,6 +1082,60 @@ class DoctorDecisions(unittest.TestCase):
         self.assertEqual(cig._auto_backend_pick(True, True), "web")    # web preferred
         self.assertEqual(cig._auto_backend_pick(False, True), "codex")
         self.assertEqual(cig._auto_backend_pick(False, False), "neither")
+
+
+class DoctorBackendOverride(unittest.TestCase):
+    """doctor must name a backend pinned by IMAGE_USE_BACKEND / the legacy
+    CHATGPT_IMAGEGEN_BACKEND instead of only saying what auto would do (#66)."""
+
+    def _doctor(self, **env):
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("IMAGE_USE_BACKEND", "CHATGPT_IMAGEGEN_BACKEND")}
+        clean.update(env)
+        out = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, clean, clear=True), \
+             unittest.mock.patch.object(cig, "_fetch_latest_info", return_value=(None, {})), \
+             unittest.mock.patch.object(cig, "_codex_token_present", return_value=True), \
+             unittest.mock.patch.object(cig, "_find_agent_browser", return_value="/x/chrome-use"), \
+             unittest.mock.patch.object(cig, "_chrome_use_version", return_value=cig.AB_MIN_VERSION), \
+             unittest.mock.patch.object(cig, "_relay_connected", return_value=True), \
+             unittest.mock.patch.object(cig, "_detect_logged_in_profiles", return_value=["Default"]), \
+             unittest.mock.patch.object(cig, "_detect_google_profiles", return_value=[]), \
+             unittest.mock.patch.object(cig, "_find_agy", return_value=None), \
+             unittest.mock.patch.object(cig.shutil, "which", return_value=None), \
+             redirect_stdout(out):
+            rc = cig._doctor_command([])
+        return rc, out.getvalue()
+
+    def test_neither_set_reports_auto(self):
+        rc, out = self._doctor()
+        self.assertEqual(rc, 0)
+        self.assertIn("→ auto would use: web  (spares Codex-usage)", out)
+        self.assertNotIn("forced", out)
+
+    def test_new_name_forces(self):
+        rc, out = self._doctor(IMAGE_USE_BACKEND="codex")
+        self.assertEqual(rc, 0)
+        self.assertIn("→ backend forced to: codex  (from IMAGE_USE_BACKEND; "
+                      "auto would use web)", out)
+        self.assertNotIn("auto would use: web", out)
+
+    def test_legacy_name_forces(self):
+        rc, out = self._doctor(CHATGPT_IMAGEGEN_BACKEND="codex")
+        self.assertEqual(rc, 0)
+        self.assertIn("→ backend forced to: codex  (from CHATGPT_IMAGEGEN_BACKEND; "
+                      "auto would use web)", out)
+
+    def test_new_name_wins_when_both_set(self):
+        rc, out = self._doctor(IMAGE_USE_BACKEND="web", CHATGPT_IMAGEGEN_BACKEND="codex")
+        self.assertIn("→ backend forced to: web  (from IMAGE_USE_BACKEND; "
+                      "auto would use web)", out)
+        self.assertNotIn("CHATGPT_IMAGEGEN_BACKEND", out)
+
+    def test_explicit_auto_is_not_an_override(self):
+        _, out = self._doctor(IMAGE_USE_BACKEND="auto", CHATGPT_IMAGEGEN_BACKEND="codex")
+        self.assertIn("→ auto would use: web", out)
+        self.assertNotIn("forced", out)
 
 
 class Color(unittest.TestCase):
