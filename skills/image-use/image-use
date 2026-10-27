@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.34.5"
+__version__ = "0.34.6"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.34.6]: doctor now names a backend pinned by IMAGE_USE_BACKEND / CHATGPT_IMAGEGEN_BACKEND instead of only showing what auto would pick; progress marks backend=X (env) (#66).
 # WHATSNEW[0.34.5]: Try the next reference-upload selector after an explicit pre-dispatch ambiguity refusal, only when the composer is empty and idle; never replay uncertain uploads (#63).
 # WHATSNEW[0.34.4]: Fix reference-image uploads in the four-input ChatGPT composer and handle Windows output encoding while preserving exact saved paths (#60, #62; thanks @IndelibleVivi and @chevalG).
 # WHATSNEW[0.34.3]: The skill now lives in skills/image-use/ with its own copy of the CLI, so Claude Code and Codex find it and a copied skill folder works on its own; upgrades from a Codex plugin cache are left to the plugin manager.
