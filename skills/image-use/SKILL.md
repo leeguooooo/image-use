@@ -293,7 +293,7 @@ A vague prompt yields a useless figure. Make the prompt describe the figure's **
 
 ## Error handling
 
-**First step for any "which backend / why isn't web working" failure:** run `image-use doctor`. It reports, read-only, the CLI's own version vs. the latest GitHub release, whether each backend is set up (codex token; chrome-use installed + version; relay connected; logged-in Chrome profiles), and **which one `auto` would pick** — turning a vague "no logged-in browser" into a precise checklist.
+**First step for any "which backend / why isn't web working" failure:** run `image-use doctor`. It reports, read-only, the CLI's own version vs. the latest GitHub release, whether each backend is set up (codex token; chrome-use installed + version; relay connected; logged-in Chrome profiles), and **which one `auto` would pick** — or, when `IMAGE_USE_BACKEND` / the legacy `CHATGPT_IMAGEGEN_BACKEND` pins a backend, `→ backend forced to: codex  (from CHATGPT_IMAGEGEN_BACKEND; auto would use web)`, since that variable wins on every run (the progress line then shows `backend=codex (env)`) — turning a vague "no logged-in browser" into a precise checklist.
 
 Update notices are covered under [Upgrade](#upgrade).
 

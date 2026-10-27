@@ -183,17 +183,26 @@ ENV_PREFIX = "IMAGE_USE_"
 LEGACY_ENV_PREFIX = "CHATGPT_IMAGEGEN_"
 
 
+def _env_source(name: str) -> tuple[str, str] | None:
+    """``(variable, value)`` for the spelling of an IMAGE_USE_* name that is
+    actually set — the new name first, then the legacy CHATGPT_IMAGEGEN_* one —
+    or None when neither is."""
+    value = os.environ.get(name)
+    if value is not None:
+        return name, value
+    if name.startswith(ENV_PREFIX):
+        legacy = LEGACY_ENV_PREFIX + name[len(ENV_PREFIX):]
+        value = os.environ.get(legacy)
+        if value is not None:
+            return legacy, value
+    return None
+
+
 def _env(name: str, default: str | None = None) -> str | None:
     """``os.environ.get`` for an IMAGE_USE_* name, falling back to the legacy
     CHATGPT_IMAGEGEN_* spelling, then to ``default``."""
-    value = os.environ.get(name)
-    if value is not None:
-        return value
-    if name.startswith(ENV_PREFIX):
-        value = os.environ.get(LEGACY_ENV_PREFIX + name[len(ENV_PREFIX):])
-        if value is not None:
-            return value
-    return default
+    found = _env_source(name)
+    return found[1] if found is not None else default
 
 # Web backend: drive the real, logged-in ChatGPT browser via chrome-use
 # (formerly agent-browser-stealth) so image generation runs on the ChatGPT
@@ -6174,6 +6183,15 @@ def _web_ready(chrome_use_installed: bool, relay: bool, n_profiles: int) -> bool
     return chrome_use_installed and (relay or n_profiles > 0)
 
 
+def _backend_env_override() -> tuple[str, str] | None:
+    """``(variable, backend)`` when IMAGE_USE_BACKEND (or its legacy spelling)
+    pins a backend other than auto — the same lookup `--backend` defaults to."""
+    found = _env_source("IMAGE_USE_BACKEND")
+    if found is None or found[1] in ("", "auto"):
+        return None
+    return found
+
+
 def _auto_backend_pick(web_ready: bool, codex_ready: bool) -> str:
     """Which backend `--backend auto` would use, given each one's readiness."""
     if web_ready:
@@ -6292,6 +6310,16 @@ def _doctor_command(argv: list[str]) -> int:
     pick = _auto_backend_pick(web_ready, codex_ready)
     arrow = _dim("→", stream=sys.stdout) if color else "→"
     _print_soft()
+    forced = _backend_env_override()
+    if forced is not None:
+        # A backend pinned in the environment (often long-forgotten in a shell
+        # rc file) wins over auto on every run — say so, or doctor misleads
+        # (issue #66).
+        var, backend = forced
+        auto_bit = "auto has no backend ready" if pick == "neither" \
+            else f"auto would use {pick}"
+        _print_soft(f"  {arrow} backend forced to: {backend}  (from {var}; {auto_bit})\n")
+        return 1 if pick == "neither" else 0
     if pick == "neither":
         _print_soft(f"  {arrow} auto: no backend ready — set up one of the above.\n")
         return 1
@@ -7027,7 +7055,7 @@ def main() -> int:
     parser.add_argument(
         "--backend",
         choices=["auto", "web", "codex", "gemini", "agy"],
-        default=_env("IMAGE_USE_BACKEND", "auto"),
+        default=None,  # resolved after parsing, so the progress line can tell env from flag
         help="auto (default): prefer web (spares Codex-usage limits); fall back "
              "to codex only if the browser isn't available/logged in. "
              "web: force the logged-in-browser path (chrome-use). "
@@ -7162,6 +7190,9 @@ def main() -> int:
              "(macOS `open`, Linux `xdg-open`, Windows default). Best-effort.",
     )
     args = parser.parse_args(argv)
+    args.backend_from_env = args.backend is None and _backend_env_override() is not None
+    if args.backend is None:
+        args.backend = _env("IMAGE_USE_BACKEND", "auto")
     try:
         _validate_project_args(args)
     except GatewayError as e:
@@ -7253,7 +7284,8 @@ def main() -> int:
             _opt_bit += f" image-model={args.image_model}"
         if getattr(args, "quality", None):
             _opt_bit += f" quality={args.quality}"
-        meta_bit = _dim(f"(backend={args.backend} size={args.size} "
+        _env_bit = " (env)" if getattr(args, "backend_from_env", False) else ""
+        meta_bit = _dim(f"(backend={args.backend}{_env_bit} size={args.size} "
                         f"format={args.format}{_opt_bit} "
                         f"timeout={args.timeout}s)")
         print(_fmt_progress(0.0, f"requesting{mode_bit} image  {meta_bit}"), file=sys.stderr)
