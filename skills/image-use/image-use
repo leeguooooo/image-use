@@ -886,8 +886,10 @@ def _build_payload(
         "tool_choice": tool_choice,
         "parallel_tool_calls": False,
         "store": False,
-        "reasoning": {"effort": "low", "summary": "auto"},
-        "include": ["reasoning.encrypted_content"],
+        # No `reasoning` / `include: [reasoning.encrypted_content]`: since
+        # 2026-11-04 the backend maps reasoning.effort onto the image tool's
+        # "complexity" and rejects every value ("Complexity 'low' is not
+        # supported for this image model", issue #69). Omitting it works.
         "text": {"verbosity": "low"},
     }
 

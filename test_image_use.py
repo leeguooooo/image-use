@@ -1841,6 +1841,14 @@ class PromptWordingByKind(unittest.TestCase):
             refs=[("Zm9v", "image/png")], n_character_refs=0, n_style_refs=1)
         self.assertEqual(payload["tool_choice"], "required")
 
+    def test_payload_sends_no_reasoning(self):
+        # issue #69: the backend rejects any reasoning.effort for the image
+        # model ("Complexity 'low' is not supported"), so it must not be sent.
+        for refs in (None, [("Zm9v", "image/png")]):
+            payload = cig._build_payload("a cat", "auto", "png", "gpt-5.6-luna", refs=refs)
+            self.assertNotIn("reasoning", payload)
+            self.assertNotIn("reasoning.encrypted_content", payload.get("include", []))
+
 
 class CodexModelFallback(unittest.TestCase):
     def test_default_is_a_fast_cheap_driver(self):
