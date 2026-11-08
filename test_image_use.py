@@ -4100,6 +4100,23 @@ class ParallelProfiles(unittest.TestCase):
         self.assertIn('_chatgpt_web_turn(progress, start, scope)', src)
         self.assertIn('session = f"{CHATGPT_WEB_SESSION}-{scope}"', src)
 
+    def test_session_profile_binding_propagates_to_subsequent_ab_calls(self):
+        cig._session_profiles.clear()
+        with unittest.mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="ok", stderr="")
+            # First call specifies profile
+            cig._ab("dummy-ab", "open", "http://example.com", session="sess-1", timeout=5.0, profile="Profile 1")
+            self.assertIn("--profile", mock_run.call_args[0][0])
+            self.assertIn("Profile 1", mock_run.call_args[0][0])
+
+            # Subsequent call in the same session omits profile, should propagate bound profile
+            cig._ab("dummy-ab", "eval", "return 1", session="sess-1", timeout=5.0)
+            self.assertIn("--profile", mock_run.call_args[0][0])
+            self.assertIn("Profile 1", mock_run.call_args[0][0])
+
+    def test_gemini_composer_selectors_include_textarea(self):
+        self.assertTrue(any("textarea" in s for s in cig.GEMINI_COMPOSER_SELECTORS))
+
 
 class EnvNames(unittest.TestCase):
     """IMAGE_USE_* is the name; CHATGPT_IMAGEGEN_* keeps working as a fallback."""
