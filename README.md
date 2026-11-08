@@ -67,6 +67,38 @@ npx -y skills update chatgpt-imagegen
 
 After that `image-use upgrade` works on its own.
 
+## Parallel generation across Chrome profiles (opt-in)
+
+The normal `web` backend **serializes all ChatGPT image generations** via the
+shared `~/.chatgpt-web.lock`, coordinating with `chatgpt-use`. This remains
+the default. To run across *different signed-in Chrome profiles* concurrently,
+explicitly choose a stable Chrome profile for each process and add
+`--parallel-profiles`:
+
+```bash
+image-use "red potion sprite" --backend web --profile "Profile 1" --parallel-profiles -o potion.png &
+image-use "blue slime sprite" --backend web --profile "Profile 2" --parallel-profiles -o slime.png &
+wait
+```
+
+Each profile receives a stable browser session and its own cross-process lock.
+Two jobs for the **same** profile still queue; jobs for different profiles can
+overlap. The default `Default` Chrome profile continues to use the legacy
+ChatGPT cross-tool lock, so existing tools keep coordinating. Explicit profile
+selection avoids unexpected account changes: `auto`, `relay`, display-name
+aliases and custom profile paths are not accepted in this mode. Use Chrome's
+canonical `Default` or `Profile N` identifier. Don't pass `--session` alongside
+this flag. A missing lock primitive or inaccessible profile lock fails instead
+of pretending the jobs are isolated.
+
+The same option works on the `gemini` backend
+(`--backend gemini --gemini-profile "Profile 3" --parallel-profiles`),
+which drives `gemini.google.com`, **not Google Flow**. This does not add a
+Flow backend. For a work queue, start one worker per profile, retain each
+job's input/output mapping, and check the returned files. Concurrent browser
+sessions still depend on the connected `chrome-use` version and actual web
+service rate limits; this is account isolation, not a guaranteed throughput.
+
 ## Usage
 
 ```bash
