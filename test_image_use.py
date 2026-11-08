@@ -3955,7 +3955,7 @@ class ChatgptWebTurnLock(unittest.TestCase):
         # the turn must wrap the inner per-process slot, not the reverse.
         src = inspect.getsource(cig._dispatch)
         turn = src.index("_chatgpt_web_turn")
-        slot = src.index('_concurrency_slot("web"')
+        slot = src.index('_concurrency_slot(slot_kind, web_limit')
         self.assertLess(turn, slot, "the cross-tool lock must be the OUTER gate")
         self.assertIn("run_web(args, progress, start, refs=refs)", src)
 
@@ -3974,7 +3974,7 @@ class ChatgptWebTurnLock(unittest.TestCase):
         # gemini.google.com is a different surface on a different account —
         # serializing it behind chatgpt.com would slow it down for nothing.
         src = inspect.getsource(cig._dispatch)
-        gemini = src.index('_concurrency_slot("gemini"')
+        gemini = src.index('_concurrency_slot(slot_kind, limit')
         self.assertNotIn("_chatgpt_web_turn", src[:gemini])
 
 
