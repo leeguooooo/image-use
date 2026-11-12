@@ -3955,7 +3955,7 @@ class ChatgptWebTurnLock(unittest.TestCase):
         # the turn must wrap the inner per-process slot, not the reverse.
         src = inspect.getsource(cig._dispatch)
         turn = src.index("_chatgpt_web_turn")
-        slot = src.index('_concurrency_slot("web"')
+        slot = src.index('_concurrency_slot(slot_kind, web_limit')
         self.assertLess(turn, slot, "the cross-tool lock must be the OUTER gate")
         self.assertIn("run_web(args, progress, start, refs=refs)", src)
 
@@ -3974,8 +3974,169 @@ class ChatgptWebTurnLock(unittest.TestCase):
         # gemini.google.com is a different surface on a different account —
         # serializing it behind chatgpt.com would slow it down for nothing.
         src = inspect.getsource(cig._dispatch)
-        gemini = src.index('_concurrency_slot("gemini"')
+        gemini = src.index('_concurrency_slot(slot_kind, limit')
         self.assertNotIn("_chatgpt_web_turn", src[:gemini])
+
+
+
+class ParallelProfiles(unittest.TestCase):
+    """Explicit multi-profile generation must not weaken legacy serialization."""
+
+    def _args(self, backend="web", profile="Profile 1", **kwargs):
+        settings = dict(backend=backend, profile=profile,
+                        parallel_profiles=True, gemini_profile=None, session=None)
+        settings.update(kwargs)
+        return argparse.Namespace(**settings)
+
+    def test_default_keeps_legacy_machine_wide_lock(self):
+        self.assertIsNone(cig._parallel_profile_scope(
+            self._args(parallel_profiles=False), "web"))
+        self.assertIsNone(cig._parallel_profile_scope(
+            self._args(profile="Default"), "web"))
+
+    def test_distinct_profiles_have_distinct_stable_lanes(self):
+        a = cig._parallel_profile_scope(self._args(profile="Profile 1"), "web")
+        b = cig._parallel_profile_scope(self._args(profile="Profile 2"), "web")
+        self.assertEqual(a, cig._parallel_profile_scope(
+            self._args(profile="Profile 1"), "web"))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, cig._parallel_profile_scope(
+            self._args(profile="Profile 1", backend="gemini"), "gemini"))
+
+    def test_explicit_profile_required_and_aliases_refused(self):
+        for profile in ("auto", "relay", "", "current", "Profile 01", "Alice",
+                        "alice@example.com", "/tmp/chrome", "profile 1"):
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(cig.GatewayError, "canonical"):
+                    cig._parallel_profile_scope(self._args(profile=profile), "web")
+
+    def test_auto_backend_and_explicit_session_refused(self):
+        with self.assertRaisesRegex(cig.GatewayError, "requires --backend"):
+            cig._parallel_profile_scope(self._args(backend="auto"), "auto")
+        with self.assertRaisesRegex(cig.GatewayError, "combined with --session"):
+            cig._parallel_profile_scope(self._args(session="another-tab"), "web")
+
+    def test_gemini_profile_override_is_authoritative(self):
+        args = self._args(backend="gemini", profile="Profile 1",
+                          gemini_profile="Profile 3")
+        self.assertEqual(cig._parallel_profile_scope(args, "gemini"),
+                         cig._parallel_profile_scope(
+                             self._args(backend="gemini", profile="Profile 3"), "gemini"))
+
+    def test_no_lock_primitive_refuses_parallel_only(self):
+        with unittest.mock.patch.object(cig, "_HAVE_FILE_LOCK", False):
+            with self.assertRaisesRegex(cig.GatewayError, "requires OS file locks"):
+                cig._parallel_profile_scope(self._args(), "web")
+            self.assertIsNone(cig._parallel_profile_scope(
+                self._args(parallel_profiles=False), "web"))
+
+    def test_distinct_lanes_have_distinct_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch.dict(
+                os.environ, {"IMAGE_USE_WEB_LOCK": str(Path(td) / "legacy.lock")}
+            ):
+                first = cig._parallel_profile_scope(self._args(profile="Profile 1"), "web")
+                second = cig._parallel_profile_scope(self._args(profile="Profile 2"), "web")
+                self.assertNotEqual(cig._chatgpt_web_lock_path(first),
+                                    cig._chatgpt_web_lock_path(second))
+                self.assertEqual(cig._chatgpt_web_lock_path(), Path(td) / "legacy.lock")
+                self.assertEqual(cig._chatgpt_web_lock_path(first).parent, Path(td))
+
+    def test_two_profile_locks_can_be_held_simultaneously(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive")
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch.dict(
+                os.environ, {"IMAGE_USE_WEB_LOCK": str(Path(td) / "legacy.lock")}
+            ):
+                a = cig._parallel_profile_scope(self._args(profile="Profile 1"), "web")
+                b = cig._parallel_profile_scope(self._args(profile="Profile 2"), "web")
+                with cig._chatgpt_web_turn(False, time.monotonic(), a):
+                    with unittest.mock.patch.object(
+                        time, "sleep", lambda seconds: self.fail("cross-profile blocked")
+                    ):
+                        with cig._chatgpt_web_turn(False, time.monotonic(), b):
+                            pass
+
+    def test_same_profile_lane_queues(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive")
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch.dict(
+                os.environ, {"IMAGE_USE_WEB_LOCK": str(Path(td) / "legacy.lock")}
+            ):
+                lane = cig._parallel_profile_scope(self._args(), "web")
+                with cig._chatgpt_web_turn(False, time.monotonic(), lane):
+                    with unittest.mock.patch.object(
+                        time, "sleep", side_effect=_Escape
+                    ):
+                        with self.assertRaises(_Escape):
+                            with cig._chatgpt_web_turn(False, time.monotonic(), lane):
+                                pass
+
+    def test_parallel_profile_lock_fails_closed(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive")
+        with tempfile.TemporaryDirectory() as td:
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"IMAGE_USE_WEB_LOCK": str(Path(td) / "missing" / "legacy.lock")}
+            ):
+                lane = cig._parallel_profile_scope(self._args(), "web")
+                with self.assertRaisesRegex(cig.GatewayError, "per-profile lock"):
+                    with cig._chatgpt_web_turn(False, time.monotonic(), lane):
+                        pass
+
+    def test_dispatch_scopes_web_slots_and_cross_tool_locks(self):
+        src = inspect.getsource(cig._dispatch)
+        self.assertIn('slot_kind = f"web-{scope}" if scope else "web"', src)
+        self.assertIn('_chatgpt_web_turn(progress, start, scope)', src)
+        self.assertIn('_concurrency_slot(slot_kind, web_limit', src)
+        self.assertIn('slot_kind = f"gemini-{scope}" if scope else "gemini"', src)
+
+    def test_recovery_uses_the_same_scope_as_generation(self):
+        src = inspect.getsource(cig._recover_command)
+        self.assertIn('_parallel_profile_scope(args, "web")', src)
+        self.assertIn('_chatgpt_web_turn(progress, start, scope)', src)
+        self.assertIn('session = f"{CHATGPT_WEB_SESSION}-{scope}"', src)
+
+    def test_session_profile_binding_propagates_to_subsequent_ab_calls(self):
+        cig._session_profiles.clear()
+        with unittest.mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="ok", stderr="")
+            # First call specifies profile
+            cig._ab("dummy-ab", "open", "http://example.com", session="sess-1", timeout=5.0, profile="Profile 1")
+            self.assertIn("--profile", mock_run.call_args[0][0])
+            self.assertIn("Profile 1", mock_run.call_args[0][0])
+
+            # Subsequent call in the same session omits profile, should propagate bound profile
+            cig._ab("dummy-ab", "eval", "return 1", session="sess-1", timeout=5.0)
+            self.assertIn("--profile", mock_run.call_args[0][0])
+            self.assertIn("Profile 1", mock_run.call_args[0][0])
+
+    def test_dispatch_rejects_parallel_for_non_browser_backends(self):
+        for backend in ("codex", "agy", "auto"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(SystemExit, "requires --backend"):
+                    cig._dispatch(self._args(backend=backend), False, 30, time.monotonic())
+
+    def test_site_profile_stays_bound_through_download_and_close(self):
+        with unittest.mock.patch.dict(cig._session_profiles, {}, clear=True), \
+             unittest.mock.patch("subprocess.run") as run:
+            run.return_value = unittest.mock.Mock(
+                returncode=0, stdout='{"success": true, "data": {"result": {}}}', stderr="")
+            cig._site_call("ab", "chatgpt/images", [], "recover-test", 5,
+                           profile="Profile 2")
+            cig._ab("ab", "eval", "download", session="recover-test", timeout=5)
+            cig._ab("ab", "close", session="recover-test", timeout=5)
+            for call in run.call_args_list:
+                self.assertEqual(call.args[0][:3], ["ab", "--profile", "Profile 2"])
+            cig._ab("ab", "open", "about:blank", session="recover-test", timeout=5)
+            self.assertNotIn("--profile", run.call_args.args[0])
+
+    def test_gemini_composer_selectors_include_textarea(self):
+        self.assertIn("textarea.gds-body-l", cig.GEMINI_COMPOSER_SELECTORS)
+        self.assertNotIn("textarea", cig.GEMINI_COMPOSER_SELECTORS)
 
 
 class EnvNames(unittest.TestCase):

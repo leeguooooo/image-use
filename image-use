@@ -306,6 +306,8 @@ GEMINI_COMPOSER_SELECTORS = (
     "rich-textarea .ql-editor",
     'div[contenteditable="true"][role="textbox"]',
     'div[contenteditable="true"]',
+    "textarea.gds-body-l",
+    'textarea[placeholder*="Gemini"]',
 )
 # No file input exists until the upload menu is opened, so img2img must click
 # this first. The UI is localised, hence the per-language candidates.
@@ -1679,22 +1681,31 @@ def _web_unavailable_message(
     return "\n".join(lines)
 
 
+# Explicit selections stay pinned for relay and launched-profile sessions.
+# A successful close releases the binding before the session name is reused.
+_session_profiles: dict[str, str] = {}
+
+
 def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | None = None,
         input_text: str | None = None) -> str:
     """Run one chrome-use subcommand, return stdout. Raises GatewayError on failure.
 
     ``profile`` (a Chrome profile name/path) is passed as chrome-use's global
-    ``--profile`` flag, which must precede the subcommand. Only the launching
-    ``open`` call needs it; later calls reuse the session's browser.
+    ``--profile`` flag, which must precede the subcommand. We bind the profile
+    to the session so subsequent calls never fall back to another connected profile.
     Large or multiline text can be passed via stdin without shell/argv limits.
     """
-    cmd = [ab]
     if profile:
-        cmd += ["--profile", profile]
+        _session_profiles[session] = profile
+    prof = profile or _session_profiles.get(session)
+    cmd = [ab]
+    if prof:
+        cmd += ["--profile", prof]
     cmd += [*ab_args, "--session", session]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=max(5.0, timeout),
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=max(5.0, timeout),
             **({"input": input_text} if input_text is not None else {})
         )
     except subprocess.TimeoutExpired:
@@ -1707,6 +1718,8 @@ def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | Non
             f"chrome-use {ab_args[0] if ab_args else ''} failed "
             f"(exit {proc.returncode}): {' / '.join(tail)[:300]}"
         )
+    if ab_args and ab_args[0] == "close":
+        _session_profiles.pop(session, None)
     return proc.stdout
 
 
@@ -2324,6 +2337,39 @@ CHATGPT_WEB_LOCK = ".chatgpt-web.lock"
 # in an afternoon.
 CHATGPT_WEB_SESSION = "chatgpt-web"
 
+
+def _parallel_profile_scope(args: argparse.Namespace, backend: str) -> str | None:
+    """Opt-in execution lane for one explicitly selected Chrome profile.
+
+    Default and relay calls retain the legacy machine-wide ChatGPT lock.
+    Profiles are named by Chrome's stable directory identifier, not an email,
+    display name or browser session alias: two spellings of the same profile
+    must not create two independent locks.
+    """
+    if not getattr(args, "parallel_profiles", False):
+        return None
+    if backend not in ("web", "gemini"):
+        raise GatewayError("--parallel-profiles requires --backend web or gemini")
+    if getattr(args, "session", None):
+        raise GatewayError("--parallel-profiles cannot be combined with --session")
+    profile = (getattr(args, "gemini_profile", None) if backend == "gemini"
+               else None) or getattr(args, "profile", None) or ""
+    profile = profile.strip()
+    if not re.fullmatch(r"(?:Default|Profile [1-9][0-9]*)", profile):
+        raise GatewayError("--parallel-profiles requires an explicit canonical "
+                           "Chrome profile (--profile 'Profile 1', or 'Default'); "
+                           "auto/relay and account-name aliases are not isolated")
+    if not _HAVE_FILE_LOCK:
+        raise GatewayError("--parallel-profiles requires OS file locks; "
+                           "cannot safely coordinate a shared browser session")
+    # Preserve interoperability with chatgpt-use's legacy global lock for the
+    # normal Chrome Default profile. Other explicitly named profiles get lanes.
+    if backend == "web" and profile == "Default":
+        return None
+    return hashlib.sha256(f"{backend}\0{profile}".encode("utf-8")).hexdigest()[:16]
+
+
+
 # Whether this process actually holds CHATGPT_WEB_LOCK. False means the lock
 # was unavailable as a primitive (no flock on this platform, or the file could
 # not be opened) — NOT that it is merely uncontended. Read by the session-name
@@ -2331,18 +2377,20 @@ CHATGPT_WEB_SESSION = "chatgpt-web"
 _chatgpt_web_lock_held = False
 
 
-def _chatgpt_web_lock_path() -> Path:
-    """Where the shared lock lives. Overridable for tests via
-    IMAGE_USE_WEB_LOCK (an absolute path); otherwise ~/.chatgpt-web.lock.
+def _chatgpt_web_lock_path(scope: str | None = None) -> Path:
+    """Legacy shared lock, or a stable per-profile lock (explicit opt-in).
+
+    The override determines the parent and base for tests. Profiles never
+    expose cookie values, email addresses or account identifiers in filenames.
     """
     override = _env("IMAGE_USE_WEB_LOCK", "").strip()
-    if override:
-        return Path(override)
-    return Path.home() / CHATGPT_WEB_LOCK
+    path = Path(override) if override else Path.home() / CHATGPT_WEB_LOCK
+    return path if scope is None else path.with_name(f"{path.name}.{scope}")
 
 
 @contextmanager
-def _chatgpt_web_turn(progress: bool, start: float) -> "Iterator[None]":
+def _chatgpt_web_turn(progress: bool, start: float,
+                      scope: str | None = None) -> "Iterator[None]":
     """Hold the cross-tool chatgpt.com lock for one whole generation.
 
     Blocks (0.5s poll) while another process — this tool or chatgpt-use — is
@@ -2358,7 +2406,7 @@ def _chatgpt_web_turn(progress: bool, start: float) -> "Iterator[None]":
               "one at a time.", file=sys.stderr)
         yield
         return
-    path = _chatgpt_web_lock_path()
+    path = _chatgpt_web_lock_path(scope)
     try:
         # O_RDWR|O_CREAT, deliberately NOT "a+" and NOT "w":
         #   * no O_TRUNC — truncating a file another process has byte-range
@@ -2369,6 +2417,8 @@ def _chatgpt_web_turn(progress: bool, start: float) -> "Iterator[None]":
         #     report a stale holder.
         f = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o644), "r+")
     except OSError as e:
+        if scope is not None:
+            raise GatewayError(f"cannot open per-profile lock {path}: {e}") from e
         print(f"warning: cannot open {path} ({e}) — proceeding without "
               f"cross-tool chatgpt.com serialization.", file=sys.stderr)
         yield
@@ -2470,8 +2520,11 @@ def run_web(
     #     name would restore serialization here, and one tab is the explicit
     #     requirement; _chatgpt_web_turn has already warned on stderr that the
     #     user must run one tool at a time.
+    profile_scope = _parallel_profile_scope(args, "web")
     if args.session:
         session = args.session
+    elif profile_scope is not None:
+        session = f"{CHATGPT_WEB_SESSION}-{profile_scope}"
     elif _chatgpt_web_lock_held or _backend_limit("web", WEB_CONCURRENCY_DEFAULT) == 1:
         session = CHATGPT_WEB_SESSION
     else:
@@ -2747,7 +2800,7 @@ def _upload_references(ab, session, ref_paths, remaining, emit) -> None:
     if not ref_paths:
         return
     initial = _web_composer_state(ab, session, remaining)
-    if initial.get("text"):
+    if (initial.get("text") or "").strip():
         raise GatewayError("ChatGPT composer is not empty; references not uploaded. "
                            + _DRAFT_HINT)
     if initial.get("attachments"):
@@ -2876,7 +2929,7 @@ def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit,
     if required_project_id:
         _assert_web_project(ab, session, required_project_id, remaining)
     initial = _web_composer_state(ab, session, remaining)
-    if initial.get("text"):
+    if (initial.get("text") or "").strip():
         raise GatewayError("ChatGPT composer is not empty; prompt not submitted. " + _DRAFT_HINT)
     emit("pasting prompt")
     _ab(ab, "fill", WEB_COMPOSER_SEL, "--stdin", input_text=user_text,
@@ -3430,7 +3483,7 @@ def _gemini_submit(ab, session, composer, text, remaining, emit) -> None:
     _ab(ab, "click", composer, session=session, timeout=min(20.0, remaining()))
     _ab(ab, "keyboard", "type", text, session=session, timeout=min(60.0, remaining()))
     empty_js = ("(() => { const e = document.querySelector(%s);"
-                " return JSON.stringify(!e || (e.innerText||'').trim().length===0); })()"
+                " return JSON.stringify(!e || ((e.value !== undefined ? e.value : e.innerText) || '').trim().length===0); })()"
                 % json.dumps(composer))
 
     def _cleared() -> bool:
@@ -3587,7 +3640,10 @@ def run_gemini(
     ab = _find_agent_browser()
     if ab is None:
         raise WebUnavailable(f"`chrome-use` is not installed — {_AB_INSTALL_HINT}")
-    session = args.session or "imagegen-gemini"
+    profile_scope = _parallel_profile_scope(args, "gemini")
+    session = (args.session or
+               (f"imagegen-gemini-{profile_scope}" if profile_scope
+                else "imagegen-gemini"))
     deadline = time.monotonic() + args.timeout
 
     def emit(msg: str) -> None:
@@ -4468,6 +4524,7 @@ def _dispatch(
     """
     try:
         _validate_project_args(args)
+        _parallel_profile_scope(args, args.backend)
     except GatewayError as e:
         sys.exit(str(e))
 
@@ -4532,29 +4589,36 @@ def _dispatch(
             sys.exit(msg)
 
     if args.backend == "gemini":
-        limit = _backend_limit("gemini", WEB_CONCURRENCY_DEFAULT)
         try:
-            with _concurrency_slot("gemini", limit, progress, start):
+            scope = _parallel_profile_scope(args, "gemini")
+            limit = _backend_limit("gemini", WEB_CONCURRENCY_DEFAULT)
+            slot_kind = f"gemini-{scope}" if scope else "gemini"
+            with _concurrency_slot(slot_kind, limit, progress, start):
                 return run_gemini(args, progress, start, refs=refs)
         except GatewayError as e:
             sys.exit(str(e))
 
     web_limit = _backend_limit("web", WEB_CONCURRENCY_DEFAULT)
+    try:
+        scope = _parallel_profile_scope(args, args.backend)
+    except GatewayError as e:
+        sys.exit(str(e))
+    slot_kind = f"web-{scope}" if scope else "web"
 
     if args.backend == "web":
         try:
-            # Outer: the cross-tool chatgpt.com lock, so chatgpt-use and a second
-            # copy of this tool queue behind us for the WHOLE generation.
-            with _chatgpt_web_turn(progress, start):
-                with _concurrency_slot("web", web_limit, progress, start):
+            # The default lane retains chatgpt-use's cross-tool global lock.
+            # Explicit named profiles hold a distinct lock for the full turn.
+            with _chatgpt_web_turn(progress, start, scope):
+                with _concurrency_slot(slot_kind, web_limit, progress, start):
                     return run_web(args, progress, start, refs=refs)
         except GatewayError as e:
             sys.exit(str(e))
 
-    # auto
+    # auto (parallel-profiles is rejected above: never silently switch accounts)
     try:
-        with _chatgpt_web_turn(progress, start):
-            with _concurrency_slot("web", web_limit, progress, start):
+        with _chatgpt_web_turn(progress, start, scope):
+            with _concurrency_slot(slot_kind, web_limit, progress, start):
                 result = run_web(args, progress, start, refs=refs)
     except WebUnavailable as e:
         if getattr(args, "require_project", False):
@@ -6359,14 +6423,17 @@ def _site_call(ab: str, spec: str, site_args: list[str], session: str,
     an adapter-level {error, hint} is promoted into that envelope with exit 1,
     so the message is read from stdout rather than lost to a bare exit code.
     """
-    cmd = [ab]
     if profile:
-        cmd += ["--profile", profile]
+        _session_profiles[session] = profile
+    prof = profile or _session_profiles.get(session)
+    cmd = [ab]
+    if prof:
+        cmd += ["--profile", prof]
     cmd += ["site", spec, *site_args, "--json", "--session", session,
             "--timeout", f"{int(timeout)}s"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout + 15)
+                              encoding="utf-8", errors="replace", timeout=timeout + 15)
     except subprocess.TimeoutExpired:
         raise GatewayError(f"chrome-use site {spec} timed out") from None
     env = None
@@ -6407,6 +6474,9 @@ def _recover_command(argv: list[str]) -> int:
                         help="Only images from the conversation's latest turn")
     parser.add_argument("--profile", default=None,
                         help="Chrome profile to use (default: the open Chrome via relay)")
+    parser.add_argument("--parallel-profiles", action="store_true",
+                        help="Use a separate lock/session for this explicitly selected "
+                             "Chrome profile; same-profile jobs still queue")
     parser.add_argument("--timeout", type=_positive_int, default=120,
                         help="Seconds for the whole recovery (default 120)")
     parser.add_argument("--quiet", action="store_true",
@@ -6435,10 +6505,15 @@ def _recover_command(argv: list[str]) -> int:
     saved: list[Path] = []
     # Same tab and lock as a web generation: a second chatgpt.com tab is what
     # gets the account throttled and lets image toasts leak between runs.
-    with _chatgpt_web_turn(progress, start):
+    try:
+        scope = _parallel_profile_scope(args, "web")
+    except GatewayError as e:
+        sys.exit(str(e))
+    session = f"{CHATGPT_WEB_SESSION}-{scope}" if scope else CHATGPT_WEB_SESSION
+    with _chatgpt_web_turn(progress, start, scope):
         try:
             emit("reading the conversation's images")
-            res = _site_call(ab, "chatgpt/images", site_args, CHATGPT_WEB_SESSION,
+            res = _site_call(ab, "chatgpt/images", site_args, session,
                              timeout=min(60.0, remaining()), profile=args.profile)
             if not isinstance(res, dict):
                 raise GatewayError(f"unexpected chatgpt/images result: {res!r}"[:300])
@@ -6468,7 +6543,7 @@ def _recover_command(argv: list[str]) -> int:
                     raise GatewayError(f"no download URL for {img.get('file_id')}: "
                                        f"{img.get('download_error')}")
                 emit(f"downloading image {n}/{len(images)}")
-                got = _ab_eval(ab, _JS_FETCH % json.dumps(url), session=CHATGPT_WEB_SESSION,
+                got = _ab_eval(ab, _JS_FETCH % json.dumps(url), session=session,
                                timeout=min(60.0, remaining()))
                 if not isinstance(got, dict) or not got.get("ok"):
                     detail = (got.get("status") or got.get("error")) if isinstance(got, dict) else got
@@ -6491,7 +6566,7 @@ def _recover_command(argv: list[str]) -> int:
             return 1
         finally:
             try:
-                _ab(ab, "close", session=CHATGPT_WEB_SESSION, timeout=15.0)
+                _ab(ab, "close", session=session, timeout=15.0)
             except Exception:
                 pass
     _record_last_output(saved[-1])
@@ -7071,6 +7146,14 @@ def main() -> int:
              "Google's C2PA provenance metadata). Neither gemini nor agy is ever "
              "chosen by auto — ask for them by name. "
              "Also settable via IMAGE_USE_BACKEND.",
+    )
+    parser.add_argument(
+        "--parallel-profiles",
+        action="store_true",
+        help="(web/gemini) opt in to simultaneous runs across different Chrome "
+             "profiles. Requires --backend web|gemini and an explicit canonical "
+             "--profile (e.g. 'Profile 1'); same-profile runs remain serialized. "
+             "Default uses the existing shared lock/session.",
     )
     parser.add_argument(
         "--gemini-profile",
