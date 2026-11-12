@@ -4114,8 +4114,29 @@ class ParallelProfiles(unittest.TestCase):
             self.assertIn("--profile", mock_run.call_args[0][0])
             self.assertIn("Profile 1", mock_run.call_args[0][0])
 
+    def test_dispatch_rejects_parallel_for_non_browser_backends(self):
+        for backend in ("codex", "agy", "auto"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(SystemExit, "requires --backend"):
+                    cig._dispatch(self._args(backend=backend), False, 30, time.monotonic())
+
+    def test_site_profile_stays_bound_through_download_and_close(self):
+        with unittest.mock.patch.dict(cig._session_profiles, {}, clear=True), \
+             unittest.mock.patch("subprocess.run") as run:
+            run.return_value = unittest.mock.Mock(
+                returncode=0, stdout='{"success": true, "data": {"result": {}}}', stderr="")
+            cig._site_call("ab", "chatgpt/images", [], "recover-test", 5,
+                           profile="Profile 2")
+            cig._ab("ab", "eval", "download", session="recover-test", timeout=5)
+            cig._ab("ab", "close", session="recover-test", timeout=5)
+            for call in run.call_args_list:
+                self.assertEqual(call.args[0][:3], ["ab", "--profile", "Profile 2"])
+            cig._ab("ab", "open", "about:blank", session="recover-test", timeout=5)
+            self.assertNotIn("--profile", run.call_args.args[0])
+
     def test_gemini_composer_selectors_include_textarea(self):
-        self.assertTrue(any("textarea" in s for s in cig.GEMINI_COMPOSER_SELECTORS))
+        self.assertIn("textarea.gds-body-l", cig.GEMINI_COMPOSER_SELECTORS)
+        self.assertNotIn("textarea", cig.GEMINI_COMPOSER_SELECTORS)
 
 
 class EnvNames(unittest.TestCase):

@@ -308,7 +308,6 @@ GEMINI_COMPOSER_SELECTORS = (
     'div[contenteditable="true"]',
     "textarea.gds-body-l",
     'textarea[placeholder*="Gemini"]',
-    "textarea",
 )
 # No file input exists until the upload menu is opened, so img2img must click
 # this first. The UI is localised, hence the per-language candidates.
@@ -1682,6 +1681,8 @@ def _web_unavailable_message(
     return "\n".join(lines)
 
 
+# Explicit selections stay pinned for relay and launched-profile sessions.
+# A successful close releases the binding before the session name is reused.
 _session_profiles: dict[str, str] = {}
 
 
@@ -1717,6 +1718,8 @@ def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | Non
             f"chrome-use {ab_args[0] if ab_args else ''} failed "
             f"(exit {proc.returncode}): {' / '.join(tail)[:300]}"
         )
+    if ab_args and ab_args[0] == "close":
+        _session_profiles.pop(session, None)
     return proc.stdout
 
 
@@ -4521,6 +4524,7 @@ def _dispatch(
     """
     try:
         _validate_project_args(args)
+        _parallel_profile_scope(args, args.backend)
     except GatewayError as e:
         sys.exit(str(e))
 
@@ -6419,9 +6423,12 @@ def _site_call(ab: str, spec: str, site_args: list[str], session: str,
     an adapter-level {error, hint} is promoted into that envelope with exit 1,
     so the message is read from stdout rather than lost to a bare exit code.
     """
-    cmd = [ab]
     if profile:
-        cmd += ["--profile", profile]
+        _session_profiles[session] = profile
+    prof = profile or _session_profiles.get(session)
+    cmd = [ab]
+    if prof:
+        cmd += ["--profile", prof]
     cmd += ["site", spec, *site_args, "--json", "--session", session,
             "--timeout", f"{int(timeout)}s"]
     try:

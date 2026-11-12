@@ -82,8 +82,10 @@ wait
 ```
 
 Each profile receives a stable browser session and its own cross-process lock.
-Two jobs for the **same** profile still queue; jobs for different profiles can
-overlap. The default `Default` Chrome profile continues to use the legacy
+Two jobs for the **same** profile still queue when both use this flag; jobs
+for different profiles can overlap. Use the flag consistently for each named
+profile: mixing flagged and unflagged calls for the same profile uses different
+locks and can cause interference. The default `Default` Chrome profile continues to use the legacy
 ChatGPT cross-tool lock, so existing tools keep coordinating. Explicit profile
 selection avoids unexpected account changes: `auto`, `relay`, display-name
 aliases and custom profile paths are not accepted in this mode. Use Chrome's
